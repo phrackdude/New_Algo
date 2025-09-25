@@ -1,2 +1,36 @@
-# Python dependencies
-# Add your required packages here
+# V6 Bayesian Trading System - Production Requirements
+# Complete dependencies for DigitalOcean deployment
+
+# Core data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Real-time market data
+databento>=0.29.0
+
+# Web dashboard
+flask>=2.3.0
+plotly>=5.15.0
+
+# Environment variables and configuration  
+python-dotenv>=1.0.0
+
+# Timezone handling
+pytz>=2023.3
+
+# Email reporting
+schedule>=1.2.0
+
+# Data visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Utilities
+tqdm>=4.65.0
+
+# Optional: Enhanced numerical computing
+scipy>=1.10.0
+
+# Testing (development only)
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
