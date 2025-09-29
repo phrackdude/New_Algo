@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-cluster_test.py - Volume Cluster Detection with Modal Position Analysis Backtest
-Tests volume cluster detection and modal position analysis on historical data.
+cluster_test.py - Volume Cluster Detection with Direction Determination Backtest
+Tests volume cluster detection, modal position analysis, and direction determination on historical data.
 
 This script:
 1. Connects to Databento API using same logic as 01_connect.py
@@ -11,7 +11,8 @@ This script:
 5. Identifies volume clusters using: 15min_cluster_volume / daily_avg_1min_volume >= 4.0x
 6. Applies rolling volume ranking (top-1 per day)
 7. Calculates modal position analysis for each cluster using 14-minute price action windows
-8. Reports cluster count and modal position distribution for analysis
+8. Determines signal direction based on modal position (LONG ≤ 0.15, NO_SIGNAL > 0.15)
+9. Reports cluster count, modal position distribution, and direction determination results
 """
 
 import os
@@ -58,6 +59,10 @@ class VolumeClusterTester:
         self.ROLLING_WINDOW_HOURS = 2.0
         self.TOP_N_CLUSTERS_PER_DAY = 1
         self.MIN_CLUSTERS_FOR_RANKING = 2
+        
+        # Direction determination parameters
+        self.TIGHT_LONG_THRESHOLD = 0.15  # Modal position threshold for long signals
+        self.ELIMINATE_SHORTS = True  # Disable short signals due to market bias
         
         # Known ES futures contracts (same as 01_connect.py)
         self.es_contracts = {
@@ -700,6 +705,58 @@ class VolumeClusterTester:
         
         return modal_analysis
     
+    def determine_signal_direction(self, modal_position: float) -> Dict[str, Any]:
+        """
+        Determine trading signal direction based on modal position
+        
+        Args:
+            modal_position: Modal position value (0.0 to 1.0)
+        
+        Returns:
+            Dictionary containing direction analysis results
+        """
+        if modal_position is None:
+            return {
+                'direction': None,
+                'position_strength': 0.0,
+                'signal_type': 'NO_DATA',
+                'reason': 'No modal position data available'
+            }
+        
+        # Long Signal Criteria
+        if modal_position <= self.TIGHT_LONG_THRESHOLD:
+            position_strength = 1.0 - (modal_position / self.TIGHT_LONG_THRESHOLD)
+            return {
+                'direction': 'long',
+                'position_strength': position_strength,
+                'signal_type': 'LONG',
+                'reason': f'Modal position {modal_position:.3f} <= {self.TIGHT_LONG_THRESHOLD} (strong buying pressure)'
+            }
+        
+        # Short Signal Criteria (Currently Disabled)
+        elif modal_position >= 0.85 and not self.ELIMINATE_SHORTS:
+            position_strength = (modal_position - 0.85) / 0.15
+            return {
+                'direction': 'short',
+                'position_strength': position_strength,
+                'signal_type': 'SHORT',
+                'reason': f'Modal position {modal_position:.3f} >= 0.85 (selling pressure)'
+            }
+        
+        # No-Trade Zone
+        else:
+            if self.ELIMINATE_SHORTS and modal_position >= 0.85:
+                reason = f'Modal position {modal_position:.3f} >= 0.85 but shorts eliminated'
+            else:
+                reason = f'Modal position {modal_position:.3f} in no-trade zone (0.15 < mp < 0.85)'
+            
+            return {
+                'direction': None,
+                'position_strength': 0.0,
+                'signal_type': 'NO_SIGNAL',
+                'reason': reason
+            }
+    
     def process_clusters_with_modal_analysis(self, bars_15min: List[Dict[str, Any]], 
                                            bars_1min: List[Dict[str, Any]],
                                            daily_thresholds: Dict[str, Dict[str, float]]) -> tuple:
@@ -740,6 +797,9 @@ class VolumeClusterTester:
                 # Calculate modal position analysis
                 modal_analysis = self.calculate_modal_position(bar['timestamp'], bars_1min)
                 
+                # Determine signal direction based on modal position
+                direction_analysis = self.determine_signal_direction(modal_analysis['modal_position'])
+                
                 # Create cluster with ranking and modal info
                 cluster_bar = bar.copy()
                 cluster_bar['volume_ratio'] = volume_ratio
@@ -759,30 +819,42 @@ class VolumeClusterTester:
                     'modal_error': modal_analysis['error']
                 })
                 
+                # Add direction analysis results
+                cluster_bar.update({
+                    'signal_direction': direction_analysis['direction'],
+                    'position_strength': direction_analysis['position_strength'],
+                    'signal_type': direction_analysis['signal_type'],
+                    'signal_reason': direction_analysis['reason']
+                })
+                
                 all_clusters.append(cluster_bar)
                 
                 # Check if this cluster is tradeable (top-N)
                 if volume_rank <= self.TOP_N_CLUSTERS_PER_DAY:
                     tradeable_clusters.append(cluster_bar)
                     
-                    if modal_analysis['modal_position'] is not None:
-                        modal_sentiment = "BULLISH" if modal_analysis['modal_position'] < 0.5 else "BEARISH"
-                        logger.info(f"🎯 TRADEABLE Cluster: {bar['timestamp']} - "
-                                   f"Volume: {cluster_volume:.0f}, Ratio: {volume_ratio:.2f}x, "
-                                   f"Rank: #{volume_rank}, Modal: {modal_analysis['modal_position']:.3f} ({modal_sentiment})")
-                    else:
-                        logger.info(f"🎯 TRADEABLE Cluster: {bar['timestamp']} - "
-                                   f"Volume: {cluster_volume:.0f}, Ratio: {volume_ratio:.2f}x, "
-                                   f"Rank: #{volume_rank}, Modal: N/A (No data)")
+                    signal_info = f"Signal: {direction_analysis['signal_type']}"
+                    if direction_analysis['direction']:
+                        signal_info += f" ({direction_analysis['direction'].upper()}, strength: {direction_analysis['position_strength']:.3f})"
+                    
+                    modal_str = f"{modal_analysis['modal_position']:.3f}" if modal_analysis['modal_position'] is not None else "N/A"
+                    logger.info(f"🎯 TRADEABLE Cluster: {bar['timestamp']} - "
+                               f"Volume: {cluster_volume:.0f}, Ratio: {volume_ratio:.2f}x, "
+                               f"Rank: #{volume_rank}, Modal: {modal_str}, "
+                               f"{signal_info}")
+                    
+                    if direction_analysis['signal_type'] != 'NO_DATA':
+                        logger.info(f"    📋 {direction_analysis['reason']}")
                 else:
-                    if modal_analysis['modal_position'] is not None:
-                        logger.info(f"📊 Cluster (not tradeable): {bar['timestamp']} - "
-                                   f"Volume: {cluster_volume:.0f}, Ratio: {volume_ratio:.2f}x, "
-                                   f"Rank: #{volume_rank}, Modal: {modal_analysis['modal_position']:.3f}")
-                    else:
-                        logger.info(f"📊 Cluster (not tradeable): {bar['timestamp']} - "
-                                   f"Volume: {cluster_volume:.0f}, Ratio: {volume_ratio:.2f}x, "
-                                   f"Rank: #{volume_rank}, Modal: N/A")
+                    signal_info = f"Signal: {direction_analysis['signal_type']}"
+                    if direction_analysis['direction']:
+                        signal_info += f" ({direction_analysis['direction'].upper()})"
+                    
+                    modal_str = f"{modal_analysis['modal_position']:.3f}" if modal_analysis['modal_position'] is not None else "N/A"
+                    logger.info(f"📊 Cluster (not tradeable): {bar['timestamp']} - "
+                               f"Volume: {cluster_volume:.0f}, Ratio: {volume_ratio:.2f}x, "
+                               f"Rank: #{volume_rank}, Modal: {modal_str}, "
+                               f"{signal_info}")
                 
                 # Add to processed clusters for future ranking decisions
                 processed_clusters.append({
@@ -865,6 +937,116 @@ class VolumeClusterTester:
         
         logger.info("=" * 60)
     
+    def print_direction_analysis_summary(self, all_clusters: List[Dict[str, Any]], 
+                                       tradeable_clusters: List[Dict[str, Any]]):
+        """Print detailed summary with direction determination analysis"""
+        logger.info("=" * 80)
+        logger.info("📊 VOLUME CLUSTER DETECTION WITH DIRECTION DETERMINATION RESULTS")
+        logger.info("=" * 80)
+        
+        total_clusters = len(all_clusters)
+        total_tradeable = len(tradeable_clusters)
+        
+        logger.info(f"🎯 Total Volume Clusters Detected: {total_clusters}")
+        logger.info(f"💰 Tradeable Clusters (Top-{self.TOP_N_CLUSTERS_PER_DAY}): {total_tradeable}")
+        logger.info(f"📈 Trade Rate: {total_tradeable/total_clusters*100:.1f}% of clusters are tradeable")
+        
+        if total_clusters == 0:
+            logger.info("❌ No volume clusters found in the 7-day period")
+            return
+        
+        # Direction Analysis - All Clusters
+        valid_clusters = [c for c in all_clusters if c['modal_position'] is not None]
+        if len(valid_clusters) > 0:
+            logger.info(f"\n🎯 DIRECTION ANALYSIS (All {len(valid_clusters)} clusters with modal data):")
+            
+            # Count signal types
+            signal_counts = {}
+            for cluster in valid_clusters:
+                signal_type = cluster['signal_type']
+                signal_counts[signal_type] = signal_counts.get(signal_type, 0) + 1
+            
+            for signal_type, count in signal_counts.items():
+                percentage = count / len(valid_clusters) * 100
+                logger.info(f"  {signal_type}: {count} clusters ({percentage:.1f}%)")
+            
+            # Long signal analysis
+            long_clusters = [c for c in valid_clusters if c['signal_type'] == 'LONG']
+            if long_clusters:
+                long_strengths = [c['position_strength'] for c in long_clusters]
+                logger.info(f"\n📈 LONG SIGNAL ANALYSIS ({len(long_clusters)} signals):")
+                logger.info(f"  Average Position Strength: {sum(long_strengths)/len(long_strengths):.3f}")
+                logger.info(f"  Strength Range: {min(long_strengths):.3f} - {max(long_strengths):.3f}")
+                
+                # Modal position distribution for long signals
+                long_modals = [c['modal_position'] for c in long_clusters]
+                logger.info(f"  Modal Position Range: {min(long_modals):.3f} - {max(long_modals):.3f}")
+                logger.info(f"  Average Modal Position: {sum(long_modals)/len(long_modals):.3f}")
+        
+        # Direction Analysis - Tradeable Clusters
+        valid_tradeable = [c for c in tradeable_clusters if c['modal_position'] is not None]
+        if len(valid_tradeable) > 0:
+            logger.info(f"\n💰 TRADEABLE DIRECTION ANALYSIS ({len(valid_tradeable)} clusters):")
+            
+            # Count signal types for tradeable
+            tradeable_signal_counts = {}
+            for cluster in valid_tradeable:
+                signal_type = cluster['signal_type']
+                tradeable_signal_counts[signal_type] = tradeable_signal_counts.get(signal_type, 0) + 1
+            
+            for signal_type, count in tradeable_signal_counts.items():
+                percentage = count / len(valid_tradeable) * 100
+                logger.info(f"  {signal_type}: {count} trades ({percentage:.1f}%)")
+            
+            # Tradeable long signal analysis
+            tradeable_longs = [c for c in valid_tradeable if c['signal_type'] == 'LONG']
+            if tradeable_longs:
+                tradeable_long_strengths = [c['position_strength'] for c in tradeable_longs]
+                logger.info(f"\n📈 TRADEABLE LONG SIGNALS ({len(tradeable_longs)} trades):")
+                logger.info(f"  Average Position Strength: {sum(tradeable_long_strengths)/len(tradeable_long_strengths):.3f}")
+                logger.info(f"  Strength Range: {min(tradeable_long_strengths):.3f} - {max(tradeable_long_strengths):.3f}")
+                
+                # Daily distribution of tradeable long signals
+                long_dates = {}
+                for cluster in tradeable_longs:
+                    date = cluster['date']
+                    long_dates[date] = long_dates.get(date, 0) + 1
+                
+                logger.info(f"  Daily Distribution: {len(long_dates)} days with long signals")
+                logger.info(f"  Average Long Signals per Day: {len(tradeable_longs)/7:.1f}")
+        
+        # Daily breakdown with direction analysis
+        clusters_by_date = {}
+        for cluster in all_clusters:
+            date = cluster['date']
+            if date not in clusters_by_date:
+                clusters_by_date[date] = []
+            clusters_by_date[date].append(cluster)
+        
+        logger.info("\n📅 Daily Breakdown with Direction Analysis:")
+        for date in sorted(clusters_by_date.keys()):
+            daily_clusters = clusters_by_date[date]
+            daily_tradeable = [c for c in daily_clusters if c['is_tradeable']]
+            
+            # Count signals by type for this day
+            daily_longs = len([c for c in daily_clusters if c['signal_type'] == 'LONG'])
+            daily_no_signals = len([c for c in daily_clusters if c['signal_type'] == 'NO_SIGNAL'])
+            
+            tradeable_longs = len([c for c in daily_tradeable if c['signal_type'] == 'LONG'])
+            tradeable_no_signals = len([c for c in daily_tradeable if c['signal_type'] == 'NO_SIGNAL'])
+            
+            logger.info(f"  {date}: {len(daily_clusters)} clusters ({len(daily_tradeable)} tradeable)")
+            logger.info(f"    All: {daily_longs} LONG, {daily_no_signals} NO_SIGNAL")
+            logger.info(f"    Tradeable: {tradeable_longs} LONG, {tradeable_no_signals} NO_SIGNAL")
+        
+        # Parameter summary
+        logger.info(f"\n⚙️  DIRECTION DETERMINATION PARAMETERS:")
+        logger.info(f"  Long Threshold: ≤ {self.TIGHT_LONG_THRESHOLD}")
+        logger.info(f"  Short Threshold: ≥ 0.85 (DISABLED: {self.ELIMINATE_SHORTS})")
+        logger.info(f"  No-Trade Zone: 0.15 < modal_position < 0.85")
+        
+        logger.info("=" * 80)
+    
     async def run_cluster_test(self):
         """Main execution flow for cluster testing"""
         logger.info("🚀 Starting Volume Cluster Detection Backtest")
@@ -898,11 +1080,11 @@ class VolumeClusterTester:
             logger.error("❌ Failed to calculate daily thresholds")
             return
         
-        # Step 6: Process clusters chronologically with modal analysis
+        # Step 6: Process clusters chronologically with modal analysis and direction determination
         all_clusters, tradeable_clusters = self.process_clusters_with_modal_analysis(bars_15min, bars_1min, daily_thresholds)
         
-        # Step 7: Print results with modal analysis
-        self.print_modal_analysis_summary(all_clusters, tradeable_clusters)
+        # Step 7: Print results with direction determination analysis
+        self.print_direction_analysis_summary(all_clusters, tradeable_clusters)
 
 
 async def main():

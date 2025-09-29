@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-02_signal.py - Volume Cluster Signal Processing Module
-Implements 15-minute volume clustering methodology matching the successful backtest.
+02_signal.py - Volume Cluster Signal Processing Module with Direction Determination
+Implements 15-minute volume clustering methodology with direction determination.
 
 This script:
 1. Buffers 1-minute bars into 15-minute clusters
 2. Calculates volume ratios: 15min_cluster_volume / daily_avg_1min_volume  
 3. Identifies volume clusters using 4.0x threshold
 4. Ranks clusters and only signals top 1-2 per day
-5. Maintains exact methodology from proven backtest
+5. Calculates modal position analysis for each cluster
+6. Determines signal direction: LONG (≤ 0.15), NO_SIGNAL (0.15-0.85), SHORT disabled
+7. Only generates trading signals for confirmed directional signals
 """
 
 import logging
@@ -30,6 +32,10 @@ VOLUME_THRESHOLD = 4.0  # 4x multiplier for cluster identification
 TOP_N_CLUSTERS_PER_DAY = 1  # Only trade top 1 cluster per day
 ROLLING_WINDOW_HOURS = 2.0  # Rolling window for volume ranking
 MIN_CLUSTERS_FOR_RANKING = 2  # Minimum clusters needed for ranking
+
+# Direction Determination Parameters
+TIGHT_LONG_THRESHOLD = 0.15  # Modal position threshold for long signals
+ELIMINATE_SHORTS = True  # Disable short signals due to market bias
 
 
 class VolumeClusterProcessor:
@@ -179,8 +185,23 @@ class VolumeClusterProcessor:
             modal_analysis = self.calculate_modal_position(timestamp)
             cluster_data.update(modal_analysis)
             
-            self.generate_trading_signal(cluster_data)
-            self.daily_cluster_count += 1
+            # Determine signal direction based on modal position
+            direction_analysis = self.determine_signal_direction(modal_analysis['modal_position'])
+            cluster_data.update({
+                'signal_direction': direction_analysis['direction'],
+                'position_strength': direction_analysis['position_strength'],
+                'signal_type': direction_analysis['signal_type'],
+                'signal_reason': direction_analysis['reason']
+            })
+            
+            # Only generate actual trading signal if direction is determined (not NO_SIGNAL)
+            if direction_analysis['direction'] is not None:
+                logger.info(f"✅ CONFIRMED TRADE: {direction_analysis['signal_type']} signal with strength {direction_analysis['position_strength']:.3f}")
+                logger.info(f"📋 {direction_analysis['reason']}")
+                self.generate_trading_signal(cluster_data)
+                self.daily_cluster_count += 1
+            else:
+                logger.info(f"⏸️  NO TRADE: {direction_analysis['signal_type']} - {direction_analysis['reason']}")
         else:
             logger.info(f"⏸️  Cluster rank {volume_rank} > {TOP_N_CLUSTERS_PER_DAY}, skipping")
         
@@ -314,9 +335,61 @@ class VolumeClusterProcessor:
         
         return modal_analysis
     
+    def determine_signal_direction(self, modal_position: float) -> Dict[str, Any]:
+        """
+        Determine trading signal direction based on modal position
+        
+        Args:
+            modal_position: Modal position value (0.0 to 1.0)
+        
+        Returns:
+            Dictionary containing direction analysis results
+        """
+        if modal_position is None:
+            return {
+                'direction': None,
+                'position_strength': 0.0,
+                'signal_type': 'NO_DATA',
+                'reason': 'No modal position data available'
+            }
+        
+        # Long Signal Criteria
+        if modal_position <= TIGHT_LONG_THRESHOLD:
+            position_strength = 1.0 - (modal_position / TIGHT_LONG_THRESHOLD)
+            return {
+                'direction': 'long',
+                'position_strength': position_strength,
+                'signal_type': 'LONG',
+                'reason': f'Modal position {modal_position:.3f} <= {TIGHT_LONG_THRESHOLD} (strong buying pressure)'
+            }
+        
+        # Short Signal Criteria (Currently Disabled)
+        elif modal_position >= 0.85 and not ELIMINATE_SHORTS:
+            position_strength = (modal_position - 0.85) / 0.15
+            return {
+                'direction': 'short',
+                'position_strength': position_strength,
+                'signal_type': 'SHORT',
+                'reason': f'Modal position {modal_position:.3f} >= 0.85 (selling pressure)'
+            }
+        
+        # No-Trade Zone
+        else:
+            if ELIMINATE_SHORTS and modal_position >= 0.85:
+                reason = f'Modal position {modal_position:.3f} >= 0.85 but shorts eliminated'
+            else:
+                reason = f'Modal position {modal_position:.3f} in no-trade zone (0.15 < mp < 0.85)'
+            
+            return {
+                'direction': None,
+                'position_strength': 0.0,
+                'signal_type': 'NO_SIGNAL',
+                'reason': reason
+            }
+    
     def generate_trading_signal(self, cluster_data: Dict[str, Any]):
         """
-        Generate trading signal for qualified volume cluster with modal position analysis
+        Generate trading signal for qualified volume cluster with direction determination
         This is where the actual trading logic would be implemented
         """
         logger.info("🎯 GENERATING TRADING SIGNAL")
@@ -327,31 +400,51 @@ class VolumeClusterProcessor:
         logger.info(f"    OHLC: O={cluster_data['open']:.2f}, H={cluster_data['high']:.2f}, "
                    f"L={cluster_data['low']:.2f}, C={cluster_data['close']:.2f}")
         
+        # Direction Determination Analysis
+        signal_type = cluster_data.get('signal_type', 'UNKNOWN')
+        signal_direction = cluster_data.get('signal_direction')
+        position_strength = cluster_data.get('position_strength', 0.0)
+        
+        logger.info(f"    📈 DIRECTION ANALYSIS:")
+        logger.info(f"        Signal Type: {signal_type}")
+        logger.info(f"        Direction: {signal_direction.upper() if signal_direction else 'NONE'}")
+        logger.info(f"        Position Strength: {position_strength:.3f}")
+        logger.info(f"        Reason: {cluster_data.get('signal_reason', 'Unknown')}")
+        
         # Modal Position Analysis
         if cluster_data.get('modal_position') is not None:
             modal_position = cluster_data['modal_position']
             modal_price = cluster_data['modal_price']
-            sentiment = "BULLISH" if modal_position < 0.5 else "BEARISH"
-            strength = "Strong" if abs(modal_position - 0.5) > 0.3 else "Weak"
             
             logger.info(f"    📊 MODAL ANALYSIS:")
             logger.info(f"        Modal Price: {modal_price:.2f}")
-            logger.info(f"        Modal Position: {modal_position:.3f} ({sentiment} - {strength})")
+            logger.info(f"        Modal Position: {modal_position:.3f}")
             logger.info(f"        Price Range: {cluster_data['price_low']:.2f} - {cluster_data['price_high']:.2f}")
             logger.info(f"        Data Points: {cluster_data['data_points']}")
             
-            # Signal strength calculation based on modal position
-            if abs(modal_position - 0.5) > 0.3:
-                logger.info(f"    🔥 STRONG SIGNAL: Modal position shows clear directional bias")
-            else:
-                logger.info(f"    ⚠️  WEAK SIGNAL: Modal position shows mixed sentiment")
+            # Signal strength classification
+            if signal_direction == 'long':
+                if position_strength > 0.7:
+                    logger.info(f"    🔥 VERY STRONG LONG: Exceptional buying pressure")
+                elif position_strength > 0.4:
+                    logger.info(f"    💪 STRONG LONG: Clear buying pressure")
+                else:
+                    logger.info(f"    📈 MODERATE LONG: Moderate buying pressure")
+            elif signal_direction == 'short':
+                if position_strength > 0.7:
+                    logger.info(f"    🔥 VERY STRONG SHORT: Exceptional selling pressure")
+                elif position_strength > 0.4:
+                    logger.info(f"    💪 STRONG SHORT: Clear selling pressure")
+                else:
+                    logger.info(f"    📉 MODERATE SHORT: Moderate selling pressure")
         else:
             logger.warning(f"    ❌ No modal analysis available: {cluster_data.get('error', 'Unknown error')}")
         
+        # ✅ Direction determination implemented
         # ✅ Modal position analysis implemented
         # TODO: Implement momentum calculation  
-        # TODO: Implement signal strength calculation
-        # TODO: Implement position sizing
+        # TODO: Implement signal strength scoring (combining volume + modal + momentum)
+        # TODO: Implement position sizing algorithm
         # TODO: Generate actual trade orders
 
 

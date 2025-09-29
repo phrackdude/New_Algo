@@ -57,10 +57,38 @@ SIGNAL NOTES - 02_Signal.py
 * **Strong Signals**: |modal_position - 0.5| > 0.3 (clear directional bias)
 * **Weak Signals**: |modal_position - 0.5| ≤ 0.3 (mixed sentiment)
 
+## DIRECTION DETERMINATION - ✅ COMPLETED
+* **Implementation**: Added direction determination logic to both cluster_test.py and 02_signal.py
+* **Parameters**: 
+  - `TIGHT_LONG_THRESHOLD = 0.15` (Modal position ≤ 0.15 triggers LONG signals)
+  - `ELIMINATE_SHORTS = True` (Short signals disabled due to market bias)
+  - No-Trade Zone: 0.15 < modal_position < 0.85
+
+### 7-Day Backtest Results (Direction Determination):
+* **Total Clusters**: 239 (238 with modal data)
+* **Tradeable Clusters**: 52 (21.8% trade rate - excellent selectivity)
+* **Direction Breakdown**:
+  - LONG signals: 9 out of 238 clusters (3.8%) - very selective
+  - NO_SIGNAL: 229 clusters (96.2%) - properly filtered out
+  - SHORT signals: 0 (disabled as intended)
+
+### Tradeable Signal Quality:
+* **Tradeable Long Signals**: 2 out of 51 tradeable clusters (3.9%)
+* **Average Position Strength**: 0.107 for tradeable longs
+* **Daily Distribution**: 0.3 long signals per day (highly selective)
+* **Signal Dates**: 2025-09-23 and 2025-09-29 (2 days with tradeable long signals)
+
+### Signal Processing Flow:
+1. Volume cluster detected (4x threshold)
+2. Rolling ranking applied (top-1 per day)
+3. Modal position calculated (14-minute window)
+4. Direction determined based on modal position
+5. Only confirmed directional signals generate actual trades
+
 ## NEXT STEPS: Continue Signal Development
 * The following calculations still need to be implemented:
     1. Momentum calculation (price momentum during cluster formation)
     2. Signal strength scoring (combining volume rank + modal position + momentum)
     3. Position sizing algorithm
     4. Risk management and stop-loss logic
-    5. 
+    5. Trade execution and order management 
