@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-02_signal.py - Signal Processing Module
-Receives and processes bar data from the data connector.
+02_signal.py - Volume Cluster Signal Processing Module
+Implements 15-minute volume clustering methodology matching the successful backtest.
 
 This script:
-1. Defines the handle_bar function interface for receiving bar data
-2. Processes incoming OHLCV data (placeholder for now)
-3. Will eventually contain trading signal logic
+1. Buffers 1-minute bars into 15-minute clusters
+2. Calculates volume ratios: 15min_cluster_volume / daily_avg_1min_volume  
+3. Identifies volume clusters using 4.0x threshold
+4. Ranks clusters and only signals top 1-2 per day
+5. Maintains exact methodology from proven backtest
 """
 
 import logging
-from datetime import datetime
-from typing import Dict, Any
+from datetime import datetime, timedelta
+from typing import Dict, Any, List, Optional
+from collections import deque
+import statistics
+import pandas as pd
 
 # Set up logging
 logging.basicConfig(
@@ -20,10 +25,344 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Volume Cluster Parameters (matching backtest)
+VOLUME_THRESHOLD = 4.0  # 4x multiplier for cluster identification
+TOP_N_CLUSTERS_PER_DAY = 1  # Only trade top 1 cluster per day
+ROLLING_WINDOW_HOURS = 2.0  # Rolling window for volume ranking
+MIN_CLUSTERS_FOR_RANKING = 2  # Minimum clusters needed for ranking
+
+
+class VolumeClusterProcessor:
+    """
+    Processes 1-minute bars into 15-minute volume clusters
+    Maintains exact methodology from successful backtest
+    """
+    
+    def __init__(self):
+        # 15-minute bar buffer (15 x 1-minute bars)
+        self.minute_bars_buffer: deque = deque(maxlen=15)
+        
+        # Daily volume tracking
+        self.daily_bars: List[Dict[str, Any]] = []
+        self.daily_avg_1min_volume: Optional[float] = None
+        self.current_date: Optional[str] = None
+        
+        # Volume cluster tracking
+        self.processed_clusters: List[Dict[str, Any]] = []
+        self.daily_cluster_count = 0
+        
+        # Historical data storage for modal analysis
+        self.historical_bars: List[Dict[str, Any]] = []
+        self.max_historical_days = 2  # Keep 2 days of data for modal analysis
+        
+        logger.info("🔧 Volume Cluster Processor initialized")
+        logger.info(f"📊 Parameters: Threshold={VOLUME_THRESHOLD}x, Top-N={TOP_N_CLUSTERS_PER_DAY}")
+    
+    def reset_daily_state(self, new_date: str):
+        """Reset state for new trading day"""
+        logger.info(f"📅 New trading day: {new_date}")
+        
+        # Calculate daily average from yesterday's data if available
+        if len(self.daily_bars) > 0:
+            volumes = [bar['volume'] for bar in self.daily_bars]
+            self.daily_avg_1min_volume = statistics.mean(volumes)
+            logger.info(f"📊 Daily avg 1-min volume: {self.daily_avg_1min_volume:.0f}")
+        
+        # Reset for new day
+        self.daily_bars = []
+        self.current_date = new_date
+        self.daily_cluster_count = 0
+        self.minute_bars_buffer.clear()
+        
+        # Keep only recent clusters for ranking (within rolling window)
+        cutoff_time = datetime.now() - timedelta(hours=ROLLING_WINDOW_HOURS)
+        self.processed_clusters = [
+            cluster for cluster in self.processed_clusters 
+            if cluster['timestamp'] >= cutoff_time
+        ]
+    
+    def add_minute_bar(self, bar_data: Dict[str, Any]):
+        """Add 1-minute bar to buffer and daily tracking"""
+        # Track for daily average calculation
+        self.daily_bars.append(bar_data.copy())
+        
+        # Add to historical data storage for modal analysis
+        self.historical_bars.append(bar_data.copy())
+        
+        # Clean up old historical data (keep only last N days)
+        if len(self.historical_bars) > self.max_historical_days * 24 * 60:  # N days * 24 hours * 60 minutes
+            self.historical_bars = self.historical_bars[-self.max_historical_days * 24 * 60:]
+        
+        # Add to 15-minute buffer
+        self.minute_bars_buffer.append(bar_data.copy())
+        
+        # Check if we have a complete 15-minute period
+        if len(self.minute_bars_buffer) == 15:
+            self.process_15min_cluster()
+    
+    def process_15min_cluster(self):
+        """
+        Process 15-minute cluster and check for volume signals
+        Exact methodology from backtest line 431: cluster_volume / avg_volume
+        """
+        if len(self.minute_bars_buffer) < 15:
+            return
+        
+        if self.daily_avg_1min_volume is None:
+            logger.debug("⏳ Waiting for daily average volume calculation")
+            return
+        
+        # Aggregate 15-minute OHLCV data
+        bars = list(self.minute_bars_buffer)
+        cluster_timestamp = bars[-1]['timestamp']  # Use last bar timestamp
+        
+        # Calculate 15-minute aggregated volume (sum of 15 x 1-minute volumes)
+        cluster_volume = sum(bar['volume'] for bar in bars)
+        
+        # Calculate OHLCV for the 15-minute period
+        cluster_open = bars[0]['open']
+        cluster_high = max(bar['high'] for bar in bars)
+        cluster_low = min(bar['low'] for bar in bars)
+        cluster_close = bars[-1]['close']
+        
+        # CRITICAL: Volume ratio calculation matching backtest line 431
+        volume_ratio = cluster_volume / self.daily_avg_1min_volume
+        
+        logger.debug(f"📊 15-min cluster: Volume={cluster_volume:.0f}, "
+                    f"Daily avg={self.daily_avg_1min_volume:.0f}, "
+                    f"Ratio={volume_ratio:.2f}x")
+        
+        # Check if this qualifies as a volume cluster (4x threshold)
+        if volume_ratio >= VOLUME_THRESHOLD:
+            self.handle_volume_cluster(
+                timestamp=cluster_timestamp,
+                volume=cluster_volume,
+                volume_ratio=volume_ratio,
+                open_price=cluster_open,
+                high_price=cluster_high,
+                low_price=cluster_low,
+                close_price=cluster_close,
+                symbol=bars[0]['symbol']
+            )
+    
+    def handle_volume_cluster(self, timestamp: datetime, volume: float, volume_ratio: float,
+                             open_price: float, high_price: float, low_price: float, 
+                             close_price: float, symbol: str):
+        """
+        Handle detected volume cluster with rolling ranking
+        Only signals if cluster ranks in top-N for the day
+        """
+        # Create cluster data
+        cluster_data = {
+            'timestamp': timestamp,
+            'symbol': symbol,
+            'volume': volume,
+            'volume_ratio': volume_ratio,
+            'open': open_price,
+            'high': high_price,
+            'low': low_price,
+            'close': close_price
+        }
+        
+        # Calculate rolling volume rank (bias-free: only uses past clusters)
+        volume_rank = self.get_rolling_volume_rank(timestamp, volume_ratio)
+        cluster_data['volume_rank'] = volume_rank
+        
+        logger.info(f"🎯 Volume cluster detected: {symbol} @ {timestamp}")
+        logger.info(f"    Volume: {volume:.0f}, Ratio: {volume_ratio:.2f}x, Rank: {volume_rank}")
+        
+        # Only signal if this cluster ranks in top-N
+        if volume_rank <= TOP_N_CLUSTERS_PER_DAY:
+            logger.info(f"🚨 TRADING SIGNAL: Top-{volume_rank} volume cluster!")
+            
+            # Calculate modal position analysis
+            modal_analysis = self.calculate_modal_position(timestamp)
+            cluster_data.update(modal_analysis)
+            
+            self.generate_trading_signal(cluster_data)
+            self.daily_cluster_count += 1
+        else:
+            logger.info(f"⏸️  Cluster rank {volume_rank} > {TOP_N_CLUSTERS_PER_DAY}, skipping")
+        
+        # Add to processed clusters for future ranking
+        self.processed_clusters.append(cluster_data)
+    
+    def get_rolling_volume_rank(self, cluster_time: datetime, cluster_volume_ratio: float) -> int:
+        """
+        BIAS-FREE VOLUME RANKING: Only uses clusters that occurred BEFORE current cluster
+        Returns the rank of current cluster among recent clusters (1 = highest volume)
+        Exact methodology from backtest lines 276-308
+        """
+        # Define rolling window - only look at clusters from past N hours
+        lookback_start = cluster_time - timedelta(hours=ROLLING_WINDOW_HOURS)
+        
+        # Filter to only past clusters within the rolling window
+        relevant_clusters = []
+        for past_cluster in self.processed_clusters:
+            if lookback_start <= past_cluster['timestamp'] < cluster_time:
+                relevant_clusters.append(past_cluster)
+        
+        # Add current cluster for ranking
+        current_cluster = {
+            'timestamp': cluster_time,
+            'volume_ratio': cluster_volume_ratio
+        }
+        all_clusters = relevant_clusters + [current_cluster]
+        
+        # Require minimum clusters for meaningful ranking
+        if len(all_clusters) < MIN_CLUSTERS_FOR_RANKING:
+            return 1  # Default to rank 1 if insufficient history
+        
+        # Sort by volume ratio (descending) and find current cluster's rank
+        sorted_clusters = sorted(all_clusters, key=lambda x: x['volume_ratio'], reverse=True)
+        
+        for rank, cluster in enumerate(sorted_clusters, 1):
+            if cluster['timestamp'] == cluster_time:
+                return rank
+        
+        return len(sorted_clusters)  # Fallback
+    
+    def calculate_modal_position(self, cluster_timestamp: datetime) -> Dict[str, Any]:
+        """
+        Calculate modal position for a volume cluster using 14-minute price action window
+        
+        Args:
+            cluster_timestamp: Timestamp of the volume cluster (15-minute bar end)
+        
+        Returns:
+            Dictionary containing modal analysis results
+        """
+        # Convert historical bars to DataFrame for easier manipulation
+        if not self.historical_bars:
+            return {
+                'modal_price': None,
+                'modal_position': None,
+                'price_high': None,
+                'price_low': None,
+                'price_range': None,
+                'data_points': 0,
+                'error': 'No historical data available'
+            }
+        
+        df = pd.DataFrame(self.historical_bars)
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df = df.sort_values('timestamp')
+        
+        # Find the cluster start time (15 minutes before cluster end)
+        cluster_start = cluster_timestamp - timedelta(minutes=15)
+        
+        # Get 14-minute window following cluster start (as per specification)
+        window_end = cluster_start + timedelta(minutes=14)
+        
+        # Filter data to the 14-minute analysis window
+        cluster_slice = df[
+            (df['timestamp'] >= cluster_start) & 
+            (df['timestamp'] < window_end)
+        ].copy()
+        
+        if len(cluster_slice) == 0:
+            logger.warning(f"⚠️ No price data found for modal analysis window: {cluster_start} to {window_end}")
+            return {
+                'modal_price': None,
+                'modal_position': None,
+                'price_high': None,
+                'price_low': None,
+                'price_range': None,
+                'data_points': 0,
+                'error': 'No data in window'
+            }
+        
+        logger.debug(f"📊 Modal analysis window: {cluster_start} to {window_end} ({len(cluster_slice)} bars)")
+        
+        # Calculate modal price (most frequently traded price level)
+        # Round to ES tick size (0.25) and find mode
+        cluster_slice['rounded_close'] = (cluster_slice['close'] / 0.25).round() * 0.25
+        
+        try:
+            # Calculate mode of rounded closing prices
+            modal_price = statistics.mode(cluster_slice['rounded_close'])
+        except statistics.StatisticsError:
+            # If no unique mode, use the most common price (first occurrence in case of tie)
+            price_counts = cluster_slice['rounded_close'].value_counts()
+            modal_price = price_counts.index[0]
+            logger.debug(f"📊 No unique mode found, using most frequent price: {modal_price}")
+        
+        # Calculate price range for the window
+        price_high = cluster_slice['high'].max()
+        price_low = cluster_slice['low'].min()
+        
+        # Calculate modal position (where modal price sits in the range)
+        price_range = price_high - price_low
+        if price_range > 1e-9:  # Avoid division by zero
+            modal_position = (modal_price - price_low) / price_range
+        else:
+            modal_position = 0.5  # Default to middle if no range
+        
+        modal_analysis = {
+            'modal_price': modal_price,
+            'modal_position': modal_position,
+            'price_high': price_high,
+            'price_low': price_low,
+            'price_range': price_range,
+            'data_points': len(cluster_slice),
+            'error': None
+        }
+        
+        # Log modal analysis results
+        sentiment = 'Bullish' if modal_position < 0.5 else 'Bearish'
+        logger.info(f"🎯 Modal Analysis: Price={modal_price:.2f}, Position={modal_position:.3f} ({sentiment})")
+        
+        return modal_analysis
+    
+    def generate_trading_signal(self, cluster_data: Dict[str, Any]):
+        """
+        Generate trading signal for qualified volume cluster with modal position analysis
+        This is where the actual trading logic would be implemented
+        """
+        logger.info("🎯 GENERATING TRADING SIGNAL")
+        logger.info(f"    Symbol: {cluster_data['symbol']}")
+        logger.info(f"    Timestamp: {cluster_data['timestamp']}")
+        logger.info(f"    Volume Ratio: {cluster_data['volume_ratio']:.2f}x")
+        logger.info(f"    Volume Rank: {cluster_data['volume_rank']}")
+        logger.info(f"    OHLC: O={cluster_data['open']:.2f}, H={cluster_data['high']:.2f}, "
+                   f"L={cluster_data['low']:.2f}, C={cluster_data['close']:.2f}")
+        
+        # Modal Position Analysis
+        if cluster_data.get('modal_position') is not None:
+            modal_position = cluster_data['modal_position']
+            modal_price = cluster_data['modal_price']
+            sentiment = "BULLISH" if modal_position < 0.5 else "BEARISH"
+            strength = "Strong" if abs(modal_position - 0.5) > 0.3 else "Weak"
+            
+            logger.info(f"    📊 MODAL ANALYSIS:")
+            logger.info(f"        Modal Price: {modal_price:.2f}")
+            logger.info(f"        Modal Position: {modal_position:.3f} ({sentiment} - {strength})")
+            logger.info(f"        Price Range: {cluster_data['price_low']:.2f} - {cluster_data['price_high']:.2f}")
+            logger.info(f"        Data Points: {cluster_data['data_points']}")
+            
+            # Signal strength calculation based on modal position
+            if abs(modal_position - 0.5) > 0.3:
+                logger.info(f"    🔥 STRONG SIGNAL: Modal position shows clear directional bias")
+            else:
+                logger.info(f"    ⚠️  WEAK SIGNAL: Modal position shows mixed sentiment")
+        else:
+            logger.warning(f"    ❌ No modal analysis available: {cluster_data.get('error', 'Unknown error')}")
+        
+        # ✅ Modal position analysis implemented
+        # TODO: Implement momentum calculation  
+        # TODO: Implement signal strength calculation
+        # TODO: Implement position sizing
+        # TODO: Generate actual trade orders
+
+
+# Global processor instance
+volume_processor = VolumeClusterProcessor()
+
 
 def handle_bar(bar_data: Dict[str, Any]) -> None:
     """
     Handle incoming bar data from the data connector.
+    Processes 1-minute bars into 15-minute volume clusters using exact backtest methodology.
     
     Args:
         bar_data (Dict[str, Any]): Bar data containing:
@@ -35,6 +374,8 @@ def handle_bar(bar_data: Dict[str, Any]) -> None:
             - close: float
             - volume: float
     """
+    global volume_processor
+    
     try:
         # Validate required fields
         required_fields = ['timestamp', 'symbol', 'open', 'high', 'low', 'close', 'volume']
@@ -44,29 +385,26 @@ def handle_bar(bar_data: Dict[str, Any]) -> None:
             logger.error(f"❌ Missing required fields in bar data: {missing_fields}")
             return
         
-        # Extract data for easier access
+        # Extract timestamp and check for new trading day
         timestamp = bar_data['timestamp']
-        symbol = bar_data['symbol']
-        ohlcv = {
-            'open': bar_data['open'],
-            'high': bar_data['high'],
-            'low': bar_data['low'],
-            'close': bar_data['close'],
-            'volume': bar_data['volume']
-        }
+        current_date = timestamp.strftime('%Y-%m-%d')
         
-        # For now, just print the received bar data
-        logger.info(f"📊 Received bar: {symbol} @ {timestamp}")
-        logger.info(f"    OHLCV: O={ohlcv['open']:.2f}, H={ohlcv['high']:.2f}, "
-                   f"L={ohlcv['low']:.2f}, C={ohlcv['close']:.2f}, V={ohlcv['volume']:.0f}")
+        # Reset daily state if new day
+        if volume_processor.current_date != current_date:
+            volume_processor.reset_daily_state(current_date)
         
-        # TODO: Add signal processing logic here
-        # This is where you would implement:
-        # - Technical indicators
-        # - Signal generation
-        # - Risk management
-        # - Position sizing
-        # - Order generation
+        # Log individual bar (debug level to reduce noise)
+        logger.debug(f"📊 Processing 1-min bar: {bar_data['symbol']} @ {timestamp}")
+        logger.debug(f"    OHLCV: O={bar_data['open']:.2f}, H={bar_data['high']:.2f}, "
+                    f"L={bar_data['low']:.2f}, C={bar_data['close']:.2f}, V={bar_data['volume']:.0f}")
+        
+        # Add bar to volume cluster processor
+        # This will automatically:
+        # 1. Buffer into 15-minute periods
+        # 2. Calculate volume ratios against daily average
+        # 3. Identify clusters using 4x threshold  
+        # 4. Rank clusters and only signal top-N per day
+        volume_processor.add_minute_bar(bar_data)
         
     except Exception as e:
         logger.error(f"❌ Error processing bar data: {e}")
