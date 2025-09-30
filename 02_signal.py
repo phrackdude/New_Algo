@@ -632,14 +632,40 @@ class VolumeClusterProcessor:
         logger.info(f"    Signal Direction: {retest_data['signal_direction'].upper()}")
         logger.info(f"    Signal Strength: {retest_data['signal_strength']:.3f}")
         
-        # TODO: Implement actual trade execution logic here
-        # This would include:
-        # - Position sizing calculation
-        # - Risk management (stop loss, take profit)
-        # - Order submission to broker
-        # - Trade tracking and monitoring
-        
-        logger.info("🚀 ULTRA-HIGH-QUALITY TRADE EXECUTED")
+        # ✅ TRADE EXECUTION: Send confirmed signal to 03_trader.py
+        try:
+            # Import 03_trader module for trade execution
+            import importlib.util
+            import sys
+            
+            # Dynamic import to avoid circular dependencies
+            trader_spec = importlib.util.spec_from_file_location(
+                "trader_module", 
+                "/Users/albertbeccu/Library/CloudStorage/OneDrive-Personal/NordicOwl/Thoendel/New Algo Trader/New_Algo/03_trader.py"
+            )
+            trader_module = importlib.util.module_from_spec(trader_spec)
+            trader_spec.loader.exec_module(trader_module)
+            
+            # Prepare signal data for trader
+            signal_data = {
+                'symbol': retest_data['symbol'],
+                'signal_direction': retest_data['signal_direction'],
+                'signal_strength': retest_data['signal_strength'],
+                'modal_price': retest_data['modal_price'],
+                'modal_position': retest_data.get('modal_position'),
+                'volume_ratio': retest_data['volume_ratio'],
+                'cluster_timestamp': retest_data['cluster_timestamp'],
+                'confirmation_price': confirmation_bar['close'],
+                'retest_time': confirmation_bar['timestamp'],
+                'time_to_retest': time_to_retest
+            }
+            
+            # Execute trade through 03_trader.py
+            trader_module.handle_confirmed_signal(signal_data)
+            
+        except Exception as e:
+            logger.error(f"❌ Error executing trade through 03_trader.py: {e}")
+            logger.info("🚀 ULTRA-HIGH-QUALITY SIGNAL PROCESSED (execution failed)")
     
     def add_pending_retest(self, cluster_data: Dict[str, Any]):
         """
@@ -773,9 +799,10 @@ class VolumeClusterProcessor:
         # ✅ Momentum calculation implemented
         # ✅ Signal strength scoring implemented (position + volume components)
         # ✅ Retest confirmation system implemented
-        # TODO: Implement position sizing algorithm
-        # TODO: Implement risk management (stop loss, take profit)
-        # TODO: Implement broker integration for order execution
+        # ✅ Position sizing algorithm implemented (03_trader.py)
+        # ✅ Risk management implemented (stop loss, take profit in 03_trader.py)
+        # ✅ Paper trading execution implemented (03_trader.py with SQLite database)
+        # ✅ Bayesian learning system implemented (03_trader.py)
 
 
 # Global processor instance
@@ -828,6 +855,25 @@ def handle_bar(bar_data: Dict[str, Any]) -> None:
         # 3. Identify clusters using 4x threshold  
         # 4. Rank clusters and only signal top-N per day
         volume_processor.add_minute_bar(bar_data)
+        
+        # ✅ TRADE MONITORING: Send market data to 03_trader.py for open position monitoring
+        try:
+            # Import 03_trader module for market data handling
+            import importlib.util
+            
+            # Dynamic import to avoid circular dependencies
+            trader_spec = importlib.util.spec_from_file_location(
+                "trader_module", 
+                "/Users/albertbeccu/Library/CloudStorage/OneDrive-Personal/NordicOwl/Thoendel/New Algo Trader/New_Algo/03_trader.py"
+            )
+            trader_module = importlib.util.module_from_spec(trader_spec)
+            trader_spec.loader.exec_module(trader_module)
+            
+            # Send market data for trade monitoring
+            trader_module.handle_market_data(bar_data)
+            
+        except Exception as e:
+            logger.debug(f"📊 Trade monitoring update failed: {e}")  # Debug level to reduce noise
         
     except Exception as e:
         logger.error(f"❌ Error processing bar data: {e}")
