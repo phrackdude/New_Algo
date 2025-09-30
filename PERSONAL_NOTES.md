@@ -85,9 +85,37 @@ SIGNAL NOTES - 02_Signal.py
 4. Direction determined based on modal position
 5. Only confirmed directional signals generate actual trades
 
+## MOMENTUM CALCULATION - ✅ COMPLETED
+* **Implementation**: Added pre-cluster momentum calculation to both cluster_test.py and 02_signal.py
+* **Methodology**: 30-minute lookback window before cluster formation
+* **Formula**: momentum = (end_price - start_price) / start_price
+* **Results**: Successfully tested on 10-day backtest with real Databento data
+
+### 10-Day Backtest Results (Momentum Analysis):
+* **Total Clusters**: 288 volume clusters detected
+* **Tradeable Clusters**: 66 (22.9% trade rate - excellent selectivity)
+* **Momentum Coverage**: 284/288 clusters (98.6% data coverage)
+* **Momentum Distribution**: 
+  - All clusters: 47.9% positive, 50.4% negative, 1.8% neutral
+  - Tradeable clusters: 34.4% positive, 60.9% negative
+  - Average momentum: -0.00% overall, -0.02% for tradeable
+
+### Long Signal + Momentum Quality:
+* **Total Long Signals**: 11 (3.8% of all clusters - very selective)
+* **Tradeable Long Signals**: 2 (excellent filtering)
+* **Long Signal Momentum**: Average +0.02% for tradeable longs (ideal alignment)
+
+### Signal Processing Flow (Updated):
+1. Volume cluster detected (4x threshold)
+2. Rolling ranking applied (top-1 per day)
+3. Modal position calculated (14-minute window)
+4. **Momentum calculated (30-minute lookback)**
+5. Direction determined based on modal position
+6. Only confirmed directional signals generate actual trades
+
 ## NEXT STEPS: Continue Signal Development
 * The following calculations still need to be implemented:
-    1. Momentum calculation (price momentum during cluster formation)
+    1. ✅ Momentum calculation (price momentum during cluster formation) - COMPLETED
     2. Signal strength scoring (combining volume rank + modal position + momentum)
     3. Position sizing algorithm
     4. Risk management and stop-loss logic

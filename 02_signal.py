@@ -185,6 +185,17 @@ class VolumeClusterProcessor:
             modal_analysis = self.calculate_modal_position(timestamp)
             cluster_data.update(modal_analysis)
             
+            # Calculate pre-cluster momentum analysis
+            momentum_analysis = self.calculate_pre_cluster_momentum(timestamp)
+            cluster_data.update({
+                'momentum': momentum_analysis['momentum'],
+                'momentum_start_price': momentum_analysis['start_price'],
+                'momentum_end_price': momentum_analysis['end_price'],
+                'momentum_price_change': momentum_analysis['price_change'],
+                'momentum_data_points': momentum_analysis['data_points'],
+                'momentum_error': momentum_analysis['error']
+            })
+            
             # Determine signal direction based on modal position
             direction_analysis = self.determine_signal_direction(modal_analysis['modal_position'])
             cluster_data.update({
@@ -335,6 +346,82 @@ class VolumeClusterProcessor:
         
         return modal_analysis
     
+    def calculate_pre_cluster_momentum(self, cluster_timestamp: datetime) -> Dict[str, Any]:
+        """
+        Calculate pre-cluster momentum using 30-minute lookback period
+        
+        Args:
+            cluster_timestamp: Timestamp of the volume cluster (15-minute bar end)
+        
+        Returns:
+            Dictionary containing momentum analysis results
+        """
+        # Convert historical bars to DataFrame for easier manipulation
+        if not self.historical_bars:
+            return {
+                'momentum': None,
+                'start_price': None,
+                'end_price': None,
+                'price_change': None,
+                'data_points': 0,
+                'error': 'No historical data available'
+            }
+        
+        df = pd.DataFrame(self.historical_bars)
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df = df.sort_values('timestamp')
+        
+        # Find the cluster start time (15 minutes before cluster end)
+        cluster_start = cluster_timestamp - timedelta(minutes=15)
+        
+        # Get 30-minute lookback window (before cluster start)
+        momentum_start = cluster_start - timedelta(minutes=30)
+        
+        # Filter data to the 30-minute momentum window
+        momentum_slice = df[
+            (df['timestamp'] >= momentum_start) & 
+            (df['timestamp'] < cluster_start)
+        ].copy()
+        
+        if len(momentum_slice) == 0:
+            logger.warning(f"⚠️ No price data found for momentum analysis window: {momentum_start} to {cluster_start}")
+            return {
+                'momentum': None,
+                'start_price': None,
+                'end_price': None,
+                'price_change': None,
+                'data_points': 0,
+                'error': 'No data in momentum window'
+            }
+        
+        logger.debug(f"📊 Momentum analysis window: {momentum_start} to {cluster_start} ({len(momentum_slice)} bars)")
+        
+        # Calculate momentum: (end_price - start_price) / start_price
+        start_price = momentum_slice.iloc[0]['close']
+        end_price = momentum_slice.iloc[-1]['close']
+        price_change = end_price - start_price
+        
+        if start_price > 1e-9:  # Avoid division by zero
+            momentum = price_change / start_price
+        else:
+            momentum = 0.0
+        
+        momentum_analysis = {
+            'momentum': momentum,
+            'start_price': start_price,
+            'end_price': end_price,
+            'price_change': price_change,
+            'data_points': len(momentum_slice),
+            'error': None
+        }
+        
+        # Log momentum analysis results
+        direction = 'Positive' if momentum > 0 else 'Negative' if momentum < 0 else 'Neutral'
+        logger.info(f"📈 Momentum Analysis: {start_price:.2f} → {end_price:.2f} ({price_change:+.2f})")
+        logger.info(f"    Momentum: {momentum:.4f} ({momentum*100:+.2f}%) - {direction}")
+        
+        return momentum_analysis
+    
     def determine_signal_direction(self, modal_position: float) -> Dict[str, Any]:
         """
         Determine trading signal direction based on modal position
@@ -440,9 +527,33 @@ class VolumeClusterProcessor:
         else:
             logger.warning(f"    ❌ No modal analysis available: {cluster_data.get('error', 'Unknown error')}")
         
+        # Momentum Analysis
+        if cluster_data.get('momentum') is not None:
+            momentum = cluster_data['momentum']
+            momentum_start_price = cluster_data.get('momentum_start_price')
+            momentum_end_price = cluster_data.get('momentum_end_price')
+            momentum_price_change = cluster_data.get('momentum_price_change')
+            
+            logger.info(f"    📈 MOMENTUM ANALYSIS:")
+            logger.info(f"        Price Change: {momentum_start_price:.2f} → {momentum_end_price:.2f} ({momentum_price_change:+.2f})")
+            logger.info(f"        Momentum: {momentum:.4f} ({momentum*100:+.2f}%)")
+            logger.info(f"        Data Points: {cluster_data.get('momentum_data_points', 0)}")
+            
+            # Momentum classification
+            if momentum > 0.001:  # > 0.1%
+                logger.info(f"    🚀 STRONG POSITIVE MOMENTUM: Excellent trend continuation setup")
+            elif momentum > 0:
+                logger.info(f"    📈 POSITIVE MOMENTUM: Favorable trend direction")
+            elif momentum < -0.001:  # < -0.1%
+                logger.info(f"    📉 STRONG NEGATIVE MOMENTUM: Potential reversal setup")
+            else:
+                logger.info(f"    ⚖️  NEUTRAL MOMENTUM: Sideways price action")
+        else:
+            logger.warning(f"    ❌ No momentum analysis available: {cluster_data.get('momentum_error', 'Unknown error')}")
+        
         # ✅ Direction determination implemented
         # ✅ Modal position analysis implemented
-        # TODO: Implement momentum calculation  
+        # ✅ Momentum calculation implemented
         # TODO: Implement signal strength scoring (combining volume + modal + momentum)
         # TODO: Implement position sizing algorithm
         # TODO: Generate actual trade orders

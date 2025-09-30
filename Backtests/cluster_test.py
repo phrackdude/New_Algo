@@ -177,21 +177,21 @@ class VolumeClusterTester:
             logger.error(f"❌ Failed to identify most liquid contract: {e}")
             return None
     
-    async def fetch_7_day_data(self) -> List[Dict[str, Any]]:
+    async def fetch_10_day_data(self) -> List[Dict[str, Any]]:
         """
-        Fetch 7 days of 1-minute OHLCV data for the selected contract
+        Fetch 10 days of 1-minute OHLCV data for the selected contract
         Returns data in the same format as handle_bar() expects
         """
         if not self.most_liquid_symbol:
             logger.error("❌ No most liquid symbol identified")
             return []
         
-        logger.info(f"📊 Fetching 7-day historical data for {self.most_liquid_symbol}...")
+        logger.info(f"📊 Fetching 10-day historical data for {self.most_liquid_symbol}...")
         
         try:
-            # Set time range for last 7 days
+            # Set time range for last 10 days
             end_time = datetime.now() - timedelta(hours=3)  # Larger buffer for data availability
-            start_time = end_time - timedelta(days=7)
+            start_time = end_time - timedelta(days=10)
             
             logger.info(f"📅 Fetching data from {start_time} to {end_time}")
             logger.debug(f"🔍 Using symbol: {self.most_liquid_symbol}")
@@ -705,6 +705,82 @@ class VolumeClusterTester:
         
         return modal_analysis
     
+    def calculate_pre_cluster_momentum(self, cluster_timestamp: datetime, 
+                                      bars_1min: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Calculate pre-cluster momentum using 30-minute lookback period
+        
+        Args:
+            cluster_timestamp: Timestamp of the volume cluster (15-minute bar end)
+            bars_1min: List of all 1-minute bars
+        
+        Returns:
+            Dictionary containing momentum analysis results
+        """
+        # Convert bars to DataFrame for easier manipulation
+        df = pd.DataFrame(bars_1min)
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df = df.sort_values('timestamp')
+        
+        # Find the cluster start time (15 minutes before cluster end)
+        cluster_start = cluster_timestamp - timedelta(minutes=15)
+        
+        # Get 30-minute lookback window (before cluster start)
+        momentum_start = cluster_start - timedelta(minutes=30)
+        
+        # Filter data to the 30-minute momentum window
+        momentum_slice = df[
+            (df['timestamp'] >= momentum_start) & 
+            (df['timestamp'] < cluster_start)
+        ].copy()
+        
+        if len(momentum_slice) == 0:
+            logger.warning(f"⚠️ No price data found for momentum analysis window: {momentum_start} to {cluster_start}")
+            return {
+                'cluster_timestamp': cluster_timestamp,
+                'momentum_start': momentum_start,
+                'momentum_end': cluster_start,
+                'momentum': None,
+                'start_price': None,
+                'end_price': None,
+                'price_change': None,
+                'data_points': 0,
+                'error': 'No data in momentum window'
+            }
+        
+        logger.debug(f"📊 Momentum analysis window: {momentum_start} to {cluster_start} ({len(momentum_slice)} bars)")
+        
+        # Calculate momentum: (end_price - start_price) / start_price
+        start_price = momentum_slice.iloc[0]['close']
+        end_price = momentum_slice.iloc[-1]['close']
+        price_change = end_price - start_price
+        
+        if start_price > 1e-9:  # Avoid division by zero
+            momentum = price_change / start_price
+        else:
+            momentum = 0.0
+        
+        momentum_analysis = {
+            'cluster_timestamp': cluster_timestamp,
+            'momentum_start': momentum_start,
+            'momentum_end': cluster_start,
+            'momentum': momentum,
+            'start_price': start_price,
+            'end_price': end_price,
+            'price_change': price_change,
+            'data_points': len(momentum_slice),
+            'error': None
+        }
+        
+        # Log momentum analysis results
+        direction = 'Positive' if momentum > 0 else 'Negative' if momentum < 0 else 'Neutral'
+        logger.info(f"📈 Momentum Analysis - Cluster @ {cluster_timestamp.strftime('%Y-%m-%d %H:%M')}")
+        logger.info(f"    Window: {momentum_start.strftime('%H:%M')} to {cluster_start.strftime('%H:%M')} ({len(momentum_slice)} bars)")
+        logger.info(f"    Price Change: {start_price:.2f} → {end_price:.2f} ({price_change:+.2f})")
+        logger.info(f"    Momentum: {momentum:.4f} ({momentum*100:+.2f}%) - {direction}")
+        
+        return momentum_analysis
+
     def determine_signal_direction(self, modal_position: float) -> Dict[str, Any]:
         """
         Determine trading signal direction based on modal position
@@ -863,6 +939,133 @@ class VolumeClusterTester:
                 })
         
         logger.info(f"✅ Processed {len(all_clusters)} clusters with modal analysis, {len(tradeable_clusters)} tradeable")
+        return all_clusters, tradeable_clusters
+    
+    def process_clusters_with_momentum_analysis(self, bars_15min: List[Dict[str, Any]], 
+                                              bars_1min: List[Dict[str, Any]],
+                                              daily_thresholds: Dict[str, Dict[str, float]]) -> tuple:
+        """
+        Process clusters chronologically with modal position AND momentum analysis
+        Returns: (all_clusters_with_momentum, tradeable_clusters_with_momentum)
+        """
+        logger.info("🔍 Processing clusters with modal position and momentum analysis...")
+        
+        all_clusters = []
+        tradeable_clusters = []
+        processed_clusters = []  # Track past clusters for ranking
+        
+        # Sort bars chronologically
+        sorted_bars = sorted(bars_15min, key=lambda x: x['timestamp'])
+        
+        for bar in sorted_bars:
+            date_str = bar['timestamp'].strftime('%Y-%m-%d')
+            
+            if date_str not in daily_thresholds:
+                continue
+            
+            thresholds = daily_thresholds[date_str]
+            daily_avg_1min_volume = thresholds['daily_avg_1min_volume']
+            
+            # Calculate volume ratio
+            cluster_volume = bar['volume']
+            volume_ratio = cluster_volume / daily_avg_1min_volume
+            
+            # Check if this qualifies as a volume cluster (4x threshold)
+            if volume_ratio >= self.VOLUME_MULTIPLIER:
+                
+                # Get rolling volume rank (only using past clusters - bias-free)
+                volume_rank = self.get_rolling_volume_rank(
+                    bar['timestamp'], volume_ratio, processed_clusters
+                )
+                
+                # Calculate modal position analysis
+                modal_analysis = self.calculate_modal_position(bar['timestamp'], bars_1min)
+                
+                # Calculate pre-cluster momentum analysis
+                momentum_analysis = self.calculate_pre_cluster_momentum(bar['timestamp'], bars_1min)
+                
+                # Determine signal direction based on modal position
+                direction_analysis = self.determine_signal_direction(modal_analysis['modal_position'])
+                
+                # Create cluster with ranking, modal, and momentum info
+                cluster_bar = bar.copy()
+                cluster_bar['volume_ratio'] = volume_ratio
+                cluster_bar['daily_avg_1min_volume'] = daily_avg_1min_volume
+                cluster_bar['volume_rank'] = volume_rank
+                cluster_bar['date'] = date_str
+                cluster_bar['is_tradeable'] = volume_rank <= self.TOP_N_CLUSTERS_PER_DAY
+                
+                # Add modal analysis results
+                cluster_bar.update({
+                    'modal_price': modal_analysis['modal_price'],
+                    'modal_position': modal_analysis['modal_position'],
+                    'price_high': modal_analysis['price_high'],
+                    'price_low': modal_analysis['price_low'],
+                    'price_range': modal_analysis['price_range'],
+                    'modal_data_points': modal_analysis['data_points'],
+                    'modal_error': modal_analysis['error']
+                })
+                
+                # Add momentum analysis results
+                cluster_bar.update({
+                    'momentum': momentum_analysis['momentum'],
+                    'momentum_start_price': momentum_analysis['start_price'],
+                    'momentum_end_price': momentum_analysis['end_price'],
+                    'momentum_price_change': momentum_analysis['price_change'],
+                    'momentum_data_points': momentum_analysis['data_points'],
+                    'momentum_error': momentum_analysis['error']
+                })
+                
+                # Add direction analysis results
+                cluster_bar.update({
+                    'signal_direction': direction_analysis['direction'],
+                    'position_strength': direction_analysis['position_strength'],
+                    'signal_type': direction_analysis['signal_type'],
+                    'signal_reason': direction_analysis['reason']
+                })
+                
+                all_clusters.append(cluster_bar)
+                
+                # Check if this cluster is tradeable (top-N)
+                if volume_rank <= self.TOP_N_CLUSTERS_PER_DAY:
+                    tradeable_clusters.append(cluster_bar)
+                    
+                    signal_info = f"Signal: {direction_analysis['signal_type']}"
+                    if direction_analysis['direction']:
+                        signal_info += f" ({direction_analysis['direction'].upper()}, strength: {direction_analysis['position_strength']:.3f})"
+                    
+                    modal_str = f"{modal_analysis['modal_position']:.3f}" if modal_analysis['modal_position'] is not None else "N/A"
+                    momentum_str = f"{momentum_analysis['momentum']:.4f}" if momentum_analysis['momentum'] is not None else "N/A"
+                    momentum_pct = f"({momentum_analysis['momentum']*100:+.2f}%)" if momentum_analysis['momentum'] is not None else ""
+                    
+                    logger.info(f"🎯 TRADEABLE Cluster: {bar['timestamp']} - "
+                               f"Volume: {cluster_volume:.0f}, Ratio: {volume_ratio:.2f}x, "
+                               f"Rank: #{volume_rank}, Modal: {modal_str}, "
+                               f"Momentum: {momentum_str} {momentum_pct}, "
+                               f"{signal_info}")
+                    
+                    if direction_analysis['signal_type'] != 'NO_DATA':
+                        logger.info(f"    📋 {direction_analysis['reason']}")
+                else:
+                    signal_info = f"Signal: {direction_analysis['signal_type']}"
+                    if direction_analysis['direction']:
+                        signal_info += f" ({direction_analysis['direction'].upper()})"
+                    
+                    modal_str = f"{modal_analysis['modal_position']:.3f}" if modal_analysis['modal_position'] is not None else "N/A"
+                    momentum_str = f"{momentum_analysis['momentum']:.4f}" if momentum_analysis['momentum'] is not None else "N/A"
+                    
+                    logger.info(f"📊 Cluster (not tradeable): {bar['timestamp']} - "
+                               f"Volume: {cluster_volume:.0f}, Ratio: {volume_ratio:.2f}x, "
+                               f"Rank: #{volume_rank}, Modal: {modal_str}, "
+                               f"Momentum: {momentum_str}, {signal_info}")
+                
+                # Add to processed clusters for future ranking decisions
+                processed_clusters.append({
+                    'timestamp': bar['timestamp'],
+                    'volume_ratio': volume_ratio
+                })
+        
+        logger.info(f"✅ Processed {len(all_clusters)} clusters with momentum analysis, {len(tradeable_clusters)} tradeable")
         return all_clusters, tradeable_clusters
     
     def print_modal_analysis_summary(self, all_clusters: List[Dict[str, Any]], 
@@ -1047,6 +1250,110 @@ class VolumeClusterTester:
         
         logger.info("=" * 80)
     
+    def print_momentum_analysis_summary(self, all_clusters: List[Dict[str, Any]], 
+                                       tradeable_clusters: List[Dict[str, Any]]):
+        """Print detailed summary with momentum analysis"""
+        logger.info("=" * 80)
+        logger.info("📊 VOLUME CLUSTER DETECTION WITH MOMENTUM ANALYSIS RESULTS")
+        logger.info("=" * 80)
+        
+        total_clusters = len(all_clusters)
+        total_tradeable = len(tradeable_clusters)
+        
+        logger.info(f"🎯 Total Volume Clusters Detected: {total_clusters}")
+        logger.info(f"💰 Tradeable Clusters (Top-{self.TOP_N_CLUSTERS_PER_DAY}): {total_tradeable}")
+        logger.info(f"📈 Trade Rate: {total_tradeable/total_clusters*100:.1f}% of clusters are tradeable")
+        
+        if total_clusters == 0:
+            logger.info("❌ No volume clusters found in the 10-day period")
+            return
+        
+        # Momentum Analysis - All Clusters
+        valid_momentum_clusters = [c for c in all_clusters if c['momentum'] is not None]
+        if len(valid_momentum_clusters) > 0:
+            logger.info(f"\n📈 MOMENTUM ANALYSIS (All {len(valid_momentum_clusters)} clusters with momentum data):")
+            
+            momentums = [c['momentum'] for c in valid_momentum_clusters]
+            positive_momentum = [m for m in momentums if m > 0]
+            negative_momentum = [m for m in momentums if m < 0]
+            neutral_momentum = [m for m in momentums if m == 0]
+            
+            logger.info(f"  Average Momentum: {sum(momentums)/len(momentums):.4f} ({sum(momentums)/len(momentums)*100:+.2f}%)")
+            logger.info(f"  Positive Momentum: {len(positive_momentum)} clusters ({len(positive_momentum)/len(momentums)*100:.1f}%)")
+            logger.info(f"  Negative Momentum: {len(negative_momentum)} clusters ({len(negative_momentum)/len(momentums)*100:.1f}%)")
+            logger.info(f"  Neutral Momentum: {len(neutral_momentum)} clusters ({len(neutral_momentum)/len(momentums)*100:.1f}%)")
+            logger.info(f"  Momentum Range: {min(momentums):.4f} to {max(momentums):.4f}")
+            
+            if positive_momentum:
+                logger.info(f"  Avg Positive Momentum: {sum(positive_momentum)/len(positive_momentum):.4f} ({sum(positive_momentum)/len(positive_momentum)*100:+.2f}%)")
+            if negative_momentum:
+                logger.info(f"  Avg Negative Momentum: {sum(negative_momentum)/len(negative_momentum):.4f} ({sum(negative_momentum)/len(negative_momentum)*100:+.2f}%)")
+        
+        # Momentum Analysis - Tradeable Clusters
+        valid_tradeable_momentum = [c for c in tradeable_clusters if c['momentum'] is not None]
+        if len(valid_tradeable_momentum) > 0:
+            logger.info(f"\n💰 TRADEABLE MOMENTUM ANALYSIS ({len(valid_tradeable_momentum)} clusters):")
+            
+            tradeable_momentums = [c['momentum'] for c in valid_tradeable_momentum]
+            tradeable_positive = [m for m in tradeable_momentums if m > 0]
+            tradeable_negative = [m for m in tradeable_momentums if m < 0]
+            
+            logger.info(f"  Average Momentum: {sum(tradeable_momentums)/len(tradeable_momentums):.4f} ({sum(tradeable_momentums)/len(tradeable_momentums)*100:+.2f}%)")
+            logger.info(f"  Positive Momentum: {len(tradeable_positive)} trades ({len(tradeable_positive)/len(tradeable_momentums)*100:.1f}%)")
+            logger.info(f"  Negative Momentum: {len(tradeable_negative)} trades ({len(tradeable_negative)/len(tradeable_momentums)*100:.1f}%)")
+            logger.info(f"  Momentum Range: {min(tradeable_momentums):.4f} to {max(tradeable_momentums):.4f}")
+        
+        # Direction + Momentum Analysis for LONG signals
+        long_clusters = [c for c in valid_momentum_clusters if c['signal_type'] == 'LONG']
+        if long_clusters:
+            logger.info(f"\n📈 LONG SIGNAL MOMENTUM ANALYSIS ({len(long_clusters)} signals):")
+            long_momentums = [c['momentum'] for c in long_clusters]
+            long_positive_momentum = [m for m in long_momentums if m > 0]
+            long_negative_momentum = [m for m in long_momentums if m < 0]
+            
+            logger.info(f"  Average Momentum: {sum(long_momentums)/len(long_momentums):.4f} ({sum(long_momentums)/len(long_momentums)*100:+.2f}%)")
+            logger.info(f"  Positive Momentum: {len(long_positive_momentum)} ({len(long_positive_momentum)/len(long_momentums)*100:.1f}%)")
+            logger.info(f"  Negative Momentum: {len(long_negative_momentum)} ({len(long_negative_momentum)/len(long_momentums)*100:.1f}%)")
+            
+            # Tradeable long signals with momentum
+            tradeable_longs = [c for c in long_clusters if c['is_tradeable']]
+            if tradeable_longs:
+                tradeable_long_momentums = [c['momentum'] for c in tradeable_longs]
+                logger.info(f"  TRADEABLE LONG SIGNALS: {len(tradeable_longs)} trades")
+                logger.info(f"    Average Momentum: {sum(tradeable_long_momentums)/len(tradeable_long_momentums):.4f} ({sum(tradeable_long_momentums)/len(tradeable_long_momentums)*100:+.2f}%)")
+        
+        # Daily breakdown with momentum
+        clusters_by_date = {}
+        for cluster in all_clusters:
+            date = cluster['date']
+            if date not in clusters_by_date:
+                clusters_by_date[date] = []
+            clusters_by_date[date].append(cluster)
+        
+        logger.info("\n📅 Daily Breakdown with Momentum Analysis:")
+        for date in sorted(clusters_by_date.keys()):
+            daily_clusters = clusters_by_date[date]
+            daily_tradeable = [c for c in daily_clusters if c['is_tradeable']]
+            
+            # Calculate daily momentum stats
+            daily_valid_momentum = [c for c in daily_clusters if c['momentum'] is not None]
+            if daily_valid_momentum:
+                daily_momentums = [c['momentum'] for c in daily_valid_momentum]
+                avg_momentum = sum(daily_momentums) / len(daily_momentums)
+                positive_count = len([m for m in daily_momentums if m > 0])
+                
+                logger.info(f"  {date}: {len(daily_clusters)} clusters ({len(daily_tradeable)} tradeable)")
+                logger.info(f"    Avg Momentum: {avg_momentum:.4f} ({avg_momentum*100:+.2f}%), "
+                           f"Positive: {positive_count}/{len(daily_momentums)} ({positive_count/len(daily_momentums)*100:.0f}%)")
+        
+        # Parameter summary
+        logger.info(f"\n⚙️  MOMENTUM ANALYSIS PARAMETERS:")
+        logger.info(f"  Lookback Period: 30 minutes before cluster start")
+        logger.info(f"  Calculation: (end_price - start_price) / start_price")
+        logger.info(f"  Combined with Modal Position Analysis")
+        
+        logger.info("=" * 80)
+    
     async def run_cluster_test(self):
         """Main execution flow for cluster testing"""
         logger.info("🚀 Starting Volume Cluster Detection Backtest")
@@ -1062,8 +1369,8 @@ class VolumeClusterTester:
             logger.error("❌ Failed to identify most liquid contract")
             return
         
-        # Step 3: Fetch 7-day historical data
-        bars_1min = await self.fetch_7_day_data()
+        # Step 3: Fetch 10-day historical data
+        bars_1min = await self.fetch_10_day_data()
         if not bars_1min:
             logger.error("❌ Failed to fetch historical data")
             return
@@ -1080,11 +1387,11 @@ class VolumeClusterTester:
             logger.error("❌ Failed to calculate daily thresholds")
             return
         
-        # Step 6: Process clusters chronologically with modal analysis and direction determination
-        all_clusters, tradeable_clusters = self.process_clusters_with_modal_analysis(bars_15min, bars_1min, daily_thresholds)
+        # Step 6: Process clusters chronologically with momentum analysis
+        all_clusters, tradeable_clusters = self.process_clusters_with_momentum_analysis(bars_15min, bars_1min, daily_thresholds)
         
-        # Step 7: Print results with direction determination analysis
-        self.print_direction_analysis_summary(all_clusters, tradeable_clusters)
+        # Step 7: Print results with momentum analysis
+        self.print_momentum_analysis_summary(all_clusters, tradeable_clusters)
 
 
 async def main():
