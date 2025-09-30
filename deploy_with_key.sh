@@ -4,12 +4,13 @@
 
 set -e  # Exit on any error
 
-# Configuration
-DROPLET_IP="104.248.137.83"
+# Configuration - Load from environment variables
+source .env
+DROPLET_IP="${DROPLET_IP}"
 DROPLET_USER="root"
 REMOTE_DIR="/root/algo_trader"
 LOCAL_DIR="/Users/albertbeccu/Library/CloudStorage/OneDrive-Personal/NordicOwl/Thoendel/New Algo Trader/New_Algo"
-SSH_KEY="~/.ssh/droplet_key"
+SSH_KEY="${DROPLET_SSH_KEY_PATH}"
 
 echo "🚀 Deploying Algorithmic Trading System to DigitalOcean Droplet"
 echo "=================================================="
@@ -179,7 +180,7 @@ start_dashboard() {
     DASHBOARD_PID=$!
     echo "✅ Dashboard started (PID: ${DASHBOARD_PID})"
     echo ${DASHBOARD_PID} > ${LOG_DIR}/dashboard.pid
-    echo "🌐 Dashboard will be available at: http://104.248.137.83:8080"
+    echo "🌐 Dashboard will be available at: http://${DROPLET_IP}:8080"
 }
 
 # Function to show status
@@ -210,7 +211,7 @@ show_status() {
     
     echo ""
     echo "🌐 Access URLs:"
-    echo "   Dashboard: http://104.248.137.83:8080"
+    echo "   Dashboard: http://${DROPLET_IP}:8080"
     echo ""
     echo "📖 Useful Commands:"
     echo "   View connector logs: tail -f ${LOG_DIR}/connector.log"

@@ -922,3 +922,4 @@ if __name__ == "__main__":
     
     # Run the profitability analysis
     results = asyncio.run(main())
+

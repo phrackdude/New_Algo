@@ -638,7 +638,7 @@ tail -f logs/connector.log    # Monitor live data feed
 
 ### Environment Variables (.env file):
 ```
-DATABENTO_API_KEY=db-L5UthvX8JgKXimv8PscsCLdkpFaBi
+DATABENTO_API_KEY=[REDACTED - stored in .env file]
 EMAIL_ADDRESS=albert.beccu@gmail.com
 EMAIL_PASSWORD=hat y
 EMAIL_RECIPIENTS=albert.beccu@gmail.com,j.thoendl@thoendl-investments.com
