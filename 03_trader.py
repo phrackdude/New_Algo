@@ -205,22 +205,33 @@ class TradingDatabase:
         """Store OHLC data for volatility calculations"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
+            
+            # Convert pandas Timestamp to string for SQLite compatibility
+            timestamp_str = str(bar_data['timestamp'])
+            
             cursor.execute("""
                 INSERT OR REPLACE INTO historical_ohlc 
                 (timestamp, symbol, open_price, high_price, low_price, close_price, volume)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (
-                bar_data['timestamp'], bar_data['symbol'], 
+                timestamp_str, bar_data['symbol'], 
                 bar_data['open'], bar_data['high'], bar_data['low'], 
                 bar_data['close'], bar_data['volume']
             ))
             
             # Clean up old data (keep only last 24 hours for volatility calculations)
-            cutoff_time = bar_data['timestamp'] - timedelta(hours=24)
+            # Convert timestamp for cutoff calculation
+            if hasattr(bar_data['timestamp'], 'to_pydatetime'):
+                # pandas Timestamp
+                cutoff_time = bar_data['timestamp'].to_pydatetime() - timedelta(hours=24)
+            else:
+                # Standard datetime
+                cutoff_time = bar_data['timestamp'] - timedelta(hours=24)
+            
             cursor.execute("""
                 DELETE FROM historical_ohlc 
                 WHERE timestamp < ? AND symbol = ?
-            """, (cutoff_time, bar_data['symbol']))
+            """, (str(cutoff_time), bar_data['symbol']))
 
 
 class VolatilityEstimator:

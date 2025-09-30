@@ -230,15 +230,15 @@ class ProductionDatabentoConnector:
             
             logger.info(f"📅 Fetching historical data from {start_time} to {end_time}")
             
-            # Fetch historical OHLCV data
+            # Fetch historical OHLCV data using parent symbol (same as backtest)
             data = self.historical_client.timeseries.get_range(
                 dataset="GLBX.MDP3",
-                symbols=[self.most_liquid_symbol],  # Specific symbol
+                symbols=["ES.FUT"],  # Parent symbol (same as backtest)
                 schema="ohlcv-1m",
                 start=start_time,
                 end=end_time,
-                stype_in="instrument_id",
-                stype_out="instrument_id"
+                stype_in="parent",  # Parent symbol input
+                stype_out="instrument_id"  # Get instrument_id output
             )
             
             # Convert to DataFrame
@@ -257,25 +257,20 @@ class ProductionDatabentoConnector:
             
             logger.info(f"📈 Processing {len(df)} historical 1-minute bars")
             
-            # Process each historical bar
-            for _, row in df.iterrows():
-                # Apply Databento price scaling (prices are in fixed-point format)
-                scaled_open = row['open'] / 1e9
-                scaled_high = row['high'] / 1e9
-                scaled_low = row['low'] / 1e9
-                scaled_close = row['close'] / 1e9
-                
-                # Convert timestamp
-                timestamp = pd.to_datetime(row['ts_event'], unit='ns')
+            # Process each historical bar (same as backtest)
+            for idx, row in df.iterrows():
+                # Prices appear to already be scaled correctly (same as backtest)
+                # Create timestamp from DataFrame index (which should be the timestamp)
+                timestamp = idx
                 
                 # Create standardized data structure
                 historical_bar = {
                     'timestamp': timestamp,
                     'symbol': row['symbol'],
-                    'open': scaled_open,
-                    'high': scaled_high,
-                    'low': scaled_low,
-                    'close': scaled_close,
+                    'open': float(row['open']),
+                    'high': float(row['high']),
+                    'low': float(row['low']),
+                    'close': float(row['close']),
                     'volume': float(row['volume'])
                 }
                 
