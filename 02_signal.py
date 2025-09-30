@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-02_signal.py - Volume Cluster Signal Processing Module with Direction Determination
-Implements 15-minute volume clustering methodology with direction determination.
+02_signal.py - Volume Cluster Signal Processing Module with Retest Confirmation
+Implements 15-minute volume clustering methodology with retest-based signal confirmation.
 
 This script:
 1. Buffers 1-minute bars into 15-minute clusters
@@ -9,8 +9,10 @@ This script:
 3. Identifies volume clusters using 4.0x threshold
 4. Ranks clusters and only signals top 1-2 per day
 5. Calculates modal position analysis for each cluster
-6. Determines signal direction: LONG (≤ 0.15), NO_SIGNAL (0.15-0.85), SHORT disabled
-7. Only generates trading signals for confirmed directional signals
+6. Determines signal direction: LONG (≤ 0.25), NO_SIGNAL (0.25-0.85), SHORT disabled
+7. Calculates signal strength using position + volume components
+8. Adds high-quality signals to retest queue (awaiting modal price confirmation)
+9. Executes ultra-high-quality trades only after retest confirmation within 30 minutes
 """
 
 import logging
@@ -34,8 +36,15 @@ ROLLING_WINDOW_HOURS = 2.0  # Rolling window for volume ranking
 MIN_CLUSTERS_FOR_RANKING = 2  # Minimum clusters needed for ranking
 
 # Direction Determination Parameters
-TIGHT_LONG_THRESHOLD = 0.15  # Modal position threshold for long signals
+TIGHT_LONG_THRESHOLD = 0.25  # Modal position threshold for long signals (optimized from 0.15)
 ELIMINATE_SHORTS = True  # Disable short signals due to market bias
+
+# Signal Strength Parameters
+MIN_SIGNAL_STRENGTH = 0.25  # Optimized threshold from 30-day analysis (was 0.45)
+
+# Retest Parameters
+RETEST_TOLERANCE = 0.75  # points tolerance for retest confirmation
+RETEST_TIMEOUT = 30  # minutes timeout for retest confirmation
 
 
 class VolumeClusterProcessor:
@@ -60,6 +69,9 @@ class VolumeClusterProcessor:
         # Historical data storage for modal analysis
         self.historical_bars: List[Dict[str, Any]] = []
         self.max_historical_days = 2  # Keep 2 days of data for modal analysis
+        
+        # Retest tracking for pending signals
+        self.pending_retests: List[Dict[str, Any]] = []
         
         logger.info("🔧 Volume Cluster Processor initialized")
         logger.info(f"📊 Parameters: Threshold={VOLUME_THRESHOLD}x, Top-N={TOP_N_CLUSTERS_PER_DAY}")
@@ -89,6 +101,12 @@ class VolumeClusterProcessor:
     
     def add_minute_bar(self, bar_data: Dict[str, Any]):
         """Add 1-minute bar to buffer and daily tracking"""
+        # Check pending retests first (before processing new clusters)
+        self.check_pending_retests(bar_data)
+        
+        # Clean up expired retests
+        self.cleanup_expired_retests(bar_data['timestamp'])
+        
         # Track for daily average calculation
         self.daily_bars.append(bar_data.copy())
         
@@ -205,14 +223,41 @@ class VolumeClusterProcessor:
                 'signal_reason': direction_analysis['reason']
             })
             
-            # Only generate actual trading signal if direction is determined (not NO_SIGNAL)
-            if direction_analysis['direction'] is not None:
-                logger.info(f"✅ CONFIRMED TRADE: {direction_analysis['signal_type']} signal with strength {direction_analysis['position_strength']:.3f}")
+            # Calculate signal strength
+            strength_analysis = self.calculate_signal_strength(
+                modal_analysis['modal_position'],
+                volume_ratio,
+                momentum_analysis['momentum'],
+                direction_analysis['direction']
+            )
+            cluster_data.update({
+                'signal_strength': strength_analysis['signal_strength'],
+                'signal_position_strength': strength_analysis['position_strength'],
+                'signal_volume_strength': strength_analysis['volume_strength'],
+                'signal_momentum_strength': strength_analysis['momentum_strength'],
+                'meets_strength_threshold': strength_analysis['meets_threshold'],
+                'strength_error': strength_analysis['error']
+            })
+            
+            # Add high-quality signals to retest queue instead of immediate execution
+            if direction_analysis['direction'] is not None and strength_analysis['meets_threshold']:
+                logger.info(f"⏳ HIGH-QUALITY SIGNAL: {direction_analysis['signal_type']} signal with strength {strength_analysis['signal_strength']:.3f}")
                 logger.info(f"📋 {direction_analysis['reason']}")
-                self.generate_trading_signal(cluster_data)
+                logger.info(f"💪 Signal Components: Pos={strength_analysis['position_strength']:.3f}, "
+                           f"Vol={strength_analysis['volume_strength']:.3f}, Mom={strength_analysis['momentum_strength']:.3f}")
+                logger.info(f"🔄 Awaiting retest confirmation at modal price {modal_analysis['modal_price']:.2f}")
+                
+                # Add to retest queue instead of immediate execution
+                self.add_pending_retest(cluster_data)
                 self.daily_cluster_count += 1
+            elif direction_analysis['direction'] is not None:
+                logger.info(f"⚠️  WEAK SIGNAL: {direction_analysis['signal_type']} signal with strength {strength_analysis['signal_strength']:.3f} < {MIN_SIGNAL_STRENGTH}")
+                logger.info(f"📋 {direction_analysis['reason']}")
+                logger.info(f"💪 Signal Components: Pos={strength_analysis['position_strength']:.3f}, "
+                           f"Vol={strength_analysis['volume_strength']:.3f}, Mom={strength_analysis['momentum_strength']:.3f}")
+                logger.info(f"📊 Not added to retest queue (insufficient strength)")
             else:
-                logger.info(f"⏸️  NO TRADE: {direction_analysis['signal_type']} - {direction_analysis['reason']}")
+                logger.info(f"⏸️  NO SIGNAL: {direction_analysis['signal_type']} - {direction_analysis['reason']} (Strength: {strength_analysis['signal_strength']:.3f})")
         else:
             logger.info(f"⏸️  Cluster rank {volume_rank} > {TOP_N_CLUSTERS_PER_DAY}, skipping")
         
@@ -465,7 +510,7 @@ class VolumeClusterProcessor:
             if ELIMINATE_SHORTS and modal_position >= 0.85:
                 reason = f'Modal position {modal_position:.3f} >= 0.85 but shorts eliminated'
             else:
-                reason = f'Modal position {modal_position:.3f} in no-trade zone (0.15 < mp < 0.85)'
+                reason = f'Modal position {modal_position:.3f} in no-trade zone ({TIGHT_LONG_THRESHOLD} < mp < 0.85)'
             
             return {
                 'direction': None,
@@ -473,6 +518,178 @@ class VolumeClusterProcessor:
                 'signal_type': 'NO_SIGNAL',
                 'reason': reason
             }
+    
+    def calculate_signal_strength(self, modal_position: float, volume_ratio: float, 
+                                momentum: float, direction: str) -> Dict[str, Any]:
+        """
+        Calculate signal strength using simplified two-component formula
+        
+        Args:
+            modal_position: Modal position value (0.0 to 1.0)
+            volume_ratio: Volume ratio (cluster_volume / daily_avg_1min_volume)
+            momentum: Pre-cluster momentum value (kept for compatibility but not used)
+            direction: Signal direction ('long', 'short', or None)
+        
+        Returns:
+            Dictionary containing signal strength analysis
+        """
+        if modal_position is None or volume_ratio is None:
+            return {
+                'signal_strength': 0.0,
+                'position_strength': 0.0,
+                'volume_strength': 0.0,
+                'momentum_strength': 0.0,
+                'meets_threshold': False,
+                'error': 'Missing required data for signal strength calculation'
+            }
+        
+        # Position Strength (70% weight) - increased from 50%
+        position_strength = 1.0 - (modal_position / TIGHT_LONG_THRESHOLD)
+        position_strength = max(0.0, min(1.0, position_strength))  # Clamp to [0, 1]
+        
+        # Volume Strength (30% weight) - same as before
+        volume_strength = min(volume_ratio / 150.0, 1.0)
+        volume_strength = max(0.0, volume_strength)  # Ensure non-negative
+        
+        # Momentum Strength (0% weight) - removed to eliminate trade blocking
+        momentum_strength = 0.0  # Always zero - momentum component removed
+        
+        # Simplified Two-Component Formula
+        signal_strength = (0.7 * position_strength + 
+                          0.3 * volume_strength)
+        
+        # Signal Threshold Check
+        meets_threshold = signal_strength >= MIN_SIGNAL_STRENGTH
+        
+        return {
+            'signal_strength': signal_strength,
+            'position_strength': position_strength,
+            'volume_strength': volume_strength,
+            'momentum_strength': momentum_strength,
+            'meets_threshold': meets_threshold,
+            'error': None
+        }
+    
+    def check_pending_retests(self, current_bar: Dict[str, Any]):
+        """
+        Check if any pending retests are confirmed by the current bar
+        
+        Args:
+            current_bar: Current 1-minute bar data
+        """
+        if not self.pending_retests:
+            return
+        
+        current_time = current_bar['timestamp']
+        current_price = current_bar['close']
+        
+        # Check each pending retest
+        completed_retests = []
+        
+        for i, retest in enumerate(self.pending_retests):
+            modal_price = retest['modal_price']
+            cluster_time = retest['cluster_timestamp']
+            
+            # Check if retest window has expired
+            time_elapsed = (current_time - cluster_time).total_seconds() / 60.0  # minutes
+            if time_elapsed > RETEST_TIMEOUT:
+                logger.info(f"⏰ Retest TIMEOUT: Modal={modal_price:.2f} after {RETEST_TIMEOUT}min")
+                completed_retests.append(i)
+                continue
+            
+            # Check if current price is within retest tolerance
+            distance = abs(current_price - modal_price)
+            if distance <= RETEST_TOLERANCE:
+                logger.info(f"✅ Retest CONFIRMED: Modal={modal_price:.2f}, Current={current_price:.2f}")
+                logger.info(f"    Distance: {distance:.2f} ≤ {RETEST_TOLERANCE}, Time: {time_elapsed:.1f}min")
+                
+                # Execute the trade signal
+                self.execute_confirmed_signal(retest, current_bar, time_elapsed)
+                completed_retests.append(i)
+        
+        # Remove completed retests (in reverse order to maintain indices)
+        for i in reversed(completed_retests):
+            del self.pending_retests[i]
+    
+    def execute_confirmed_signal(self, retest_data: Dict[str, Any], 
+                                confirmation_bar: Dict[str, Any], 
+                                time_to_retest: float):
+        """
+        Execute a trading signal that has been confirmed by retest
+        
+        Args:
+            retest_data: Original cluster data with signal information
+            confirmation_bar: Bar that confirmed the retest
+            time_to_retest: Time elapsed from cluster to retest confirmation
+        """
+        logger.info("🎯 EXECUTING CONFIRMED TRADE SIGNAL")
+        logger.info(f"    Symbol: {retest_data['symbol']}")
+        logger.info(f"    Original Cluster: {retest_data['cluster_timestamp']}")
+        logger.info(f"    Retest Confirmation: {confirmation_bar['timestamp']}")
+        logger.info(f"    Time to Confirmation: {time_to_retest:.1f} minutes")
+        logger.info(f"    Modal Price: {retest_data['modal_price']:.2f}")
+        logger.info(f"    Confirmation Price: {confirmation_bar['close']:.2f}")
+        logger.info(f"    Signal Direction: {retest_data['signal_direction'].upper()}")
+        logger.info(f"    Signal Strength: {retest_data['signal_strength']:.3f}")
+        
+        # TODO: Implement actual trade execution logic here
+        # This would include:
+        # - Position sizing calculation
+        # - Risk management (stop loss, take profit)
+        # - Order submission to broker
+        # - Trade tracking and monitoring
+        
+        logger.info("🚀 ULTRA-HIGH-QUALITY TRADE EXECUTED")
+    
+    def add_pending_retest(self, cluster_data: Dict[str, Any]):
+        """
+        Add a cluster to pending retest queue if it meets quality criteria
+        
+        Args:
+            cluster_data: Cluster data with signal information
+        """
+        # Only add to retest queue if it's a high-quality signal
+        if (cluster_data.get('signal_direction') is not None and 
+            cluster_data.get('meets_strength_threshold') and
+            cluster_data.get('modal_price') is not None):
+            
+            retest_entry = {
+                'cluster_timestamp': cluster_data['timestamp'],
+                'symbol': cluster_data['symbol'],
+                'modal_price': cluster_data['modal_price'],
+                'signal_direction': cluster_data['signal_direction'],
+                'signal_strength': cluster_data['signal_strength'],
+                'volume_ratio': cluster_data['volume_ratio'],
+                'volume_rank': cluster_data['volume_rank']
+            }
+            
+            self.pending_retests.append(retest_entry)
+            logger.info(f"⏳ Added to retest queue: {cluster_data['signal_direction'].upper()} signal at {cluster_data['modal_price']:.2f}")
+            logger.info(f"    Pending retests: {len(self.pending_retests)}")
+        else:
+            logger.debug("📊 Signal not added to retest queue (insufficient quality)")
+    
+    def cleanup_expired_retests(self, current_time: datetime):
+        """
+        Remove expired retests from the pending queue
+        
+        Args:
+            current_time: Current timestamp
+        """
+        if not self.pending_retests:
+            return
+        
+        expired_indices = []
+        for i, retest in enumerate(self.pending_retests):
+            time_elapsed = (current_time - retest['cluster_timestamp']).total_seconds() / 60.0
+            if time_elapsed > RETEST_TIMEOUT:
+                expired_indices.append(i)
+        
+        # Remove expired retests
+        for i in reversed(expired_indices):
+            expired_retest = self.pending_retests[i]
+            logger.info(f"⏰ Retest EXPIRED: {expired_retest['signal_direction'].upper()} signal at {expired_retest['modal_price']:.2f}")
+            del self.pending_retests[i]
     
     def generate_trading_signal(self, cluster_data: Dict[str, Any]):
         """
@@ -554,9 +771,11 @@ class VolumeClusterProcessor:
         # ✅ Direction determination implemented
         # ✅ Modal position analysis implemented
         # ✅ Momentum calculation implemented
-        # TODO: Implement signal strength scoring (combining volume + modal + momentum)
+        # ✅ Signal strength scoring implemented (position + volume components)
+        # ✅ Retest confirmation system implemented
         # TODO: Implement position sizing algorithm
-        # TODO: Generate actual trade orders
+        # TODO: Implement risk management (stop loss, take profit)
+        # TODO: Implement broker integration for order execution
 
 
 # Global processor instance

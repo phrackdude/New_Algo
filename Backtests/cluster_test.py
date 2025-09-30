@@ -61,8 +61,15 @@ class VolumeClusterTester:
         self.MIN_CLUSTERS_FOR_RANKING = 2
         
         # Direction determination parameters
-        self.TIGHT_LONG_THRESHOLD = 0.15  # Modal position threshold for long signals
+        self.TIGHT_LONG_THRESHOLD = 0.25  # Modal position threshold for long signals (optimized from 0.15)
         self.ELIMINATE_SHORTS = True  # Disable short signals due to market bias
+        
+        # Signal Strength Parameters
+        self.MIN_SIGNAL_STRENGTH = 0.25  # Optimized threshold from 30-day analysis (was 0.45)
+        
+        # Retest Parameters
+        self.RETEST_TOLERANCE = 0.75  # points tolerance for retest confirmation
+        self.RETEST_TIMEOUT = 30  # minutes timeout for retest confirmation
         
         # Known ES futures contracts (same as 01_connect.py)
         self.es_contracts = {
@@ -833,6 +840,164 @@ class VolumeClusterTester:
                 'reason': reason
             }
     
+    def calculate_signal_strength(self, modal_position: float, volume_ratio: float, 
+                                momentum: float, direction: str) -> Dict[str, Any]:
+        """
+        Calculate signal strength using simplified two-component formula
+        
+        Args:
+            modal_position: Modal position value (0.0 to 1.0)
+            volume_ratio: Volume ratio (cluster_volume / daily_avg_1min_volume)
+            momentum: Pre-cluster momentum value (kept for compatibility but not used)
+            direction: Signal direction ('long', 'short', or None)
+        
+        Returns:
+            Dictionary containing signal strength analysis
+        """
+        if modal_position is None or volume_ratio is None:
+            return {
+                'signal_strength': 0.0,
+                'position_strength': 0.0,
+                'volume_strength': 0.0,
+                'momentum_strength': 0.0,
+                'meets_threshold': False,
+                'error': 'Missing required data for signal strength calculation'
+            }
+        
+        # Position Strength (70% weight) - increased from 50%
+        position_strength = 1.0 - (modal_position / self.TIGHT_LONG_THRESHOLD)
+        position_strength = max(0.0, min(1.0, position_strength))  # Clamp to [0, 1]
+        
+        # Volume Strength (30% weight) - same as before
+        volume_strength = min(volume_ratio / 150.0, 1.0)
+        volume_strength = max(0.0, volume_strength)  # Ensure non-negative
+        
+        # Momentum Strength (0% weight) - removed to eliminate trade blocking
+        momentum_strength = 0.0  # Always zero - momentum component removed
+        
+        # Simplified Two-Component Formula
+        signal_strength = (0.7 * position_strength + 
+                          0.3 * volume_strength)
+        
+        # Signal Threshold Check
+        meets_threshold = signal_strength >= self.MIN_SIGNAL_STRENGTH
+        
+        return {
+            'signal_strength': signal_strength,
+            'position_strength': position_strength,
+            'volume_strength': volume_strength,
+            'momentum_strength': momentum_strength,
+            'meets_threshold': meets_threshold,
+            'error': None
+        }
+    
+    def calculate_retest_confirmation(self, cluster_timestamp: datetime, modal_price: float,
+                                    bars_1min: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Calculate retest confirmation for a volume cluster using post-cluster price action
+        
+        Args:
+            cluster_timestamp: Timestamp of the volume cluster (15-minute bar end)
+            modal_price: Modal price level to test for retest
+            bars_1min: List of all 1-minute bars
+        
+        Returns:
+            Dictionary containing retest analysis results
+        """
+        if modal_price is None:
+            return {
+                'retest_confirmed': False,
+                'retest_time': None,
+                'retest_price': None,
+                'time_to_retest': None,
+                'min_distance': None,
+                'timeout_occurred': False,
+                'data_points': 0,
+                'error': 'No modal price available'
+            }
+        
+        # Convert bars to DataFrame for easier manipulation
+        df = pd.DataFrame(bars_1min)
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df = df.sort_values('timestamp')
+        
+        # Find the cluster end time
+        cluster_end = cluster_timestamp
+        
+        # Get retest window: 30 minutes after cluster end
+        retest_window_end = cluster_end + timedelta(minutes=self.RETEST_TIMEOUT)
+        
+        # Filter data to the retest analysis window
+        retest_slice = df[
+            (df['timestamp'] > cluster_end) & 
+            (df['timestamp'] <= retest_window_end)
+        ].copy()
+        
+        if len(retest_slice) == 0:
+            logger.warning(f"⚠️ No price data found for retest window: {cluster_end} to {retest_window_end}")
+            return {
+                'retest_confirmed': False,
+                'retest_time': None,
+                'retest_price': None,
+                'time_to_retest': None,
+                'min_distance': None,
+                'timeout_occurred': True,
+                'data_points': 0,
+                'error': 'No data in retest window'
+            }
+        
+        logger.debug(f"📊 Retest analysis window: {cluster_end} to {retest_window_end} ({len(retest_slice)} bars)")
+        
+        # Check each minute for retest confirmation
+        retest_confirmed = False
+        retest_time = None
+        retest_price = None
+        time_to_retest = None
+        min_distance = float('inf')
+        
+        for idx, row in retest_slice.iterrows():
+            current_time = row['timestamp']
+            current_price = row['close']
+            
+            # Calculate distance from modal price
+            distance = abs(current_price - modal_price)
+            min_distance = min(min_distance, distance)
+            
+            # Check if within retest tolerance
+            if distance <= self.RETEST_TOLERANCE:
+                retest_confirmed = True
+                retest_time = current_time
+                retest_price = current_price
+                time_to_retest = (current_time - cluster_end).total_seconds() / 60.0  # minutes
+                break
+        
+        # Handle case where min_distance was never updated
+        if min_distance == float('inf'):
+            min_distance = None
+        
+        timeout_occurred = not retest_confirmed
+        
+        retest_analysis = {
+            'retest_confirmed': retest_confirmed,
+            'retest_time': retest_time,
+            'retest_price': retest_price,
+            'time_to_retest': time_to_retest,
+            'min_distance': min_distance,
+            'timeout_occurred': timeout_occurred,
+            'data_points': len(retest_slice),
+            'error': None
+        }
+        
+        # Log retest analysis results
+        if retest_confirmed:
+            logger.info(f"✅ Retest CONFIRMED: Modal={modal_price:.2f}, Retest={retest_price:.2f} @ {retest_time.strftime('%H:%M')}")
+            logger.info(f"    Distance: {abs(retest_price - modal_price):.2f} ≤ {self.RETEST_TOLERANCE}, Time: {time_to_retest:.1f}min")
+        else:
+            logger.info(f"❌ Retest FAILED: Modal={modal_price:.2f}, Min distance: {min_distance:.2f} > {self.RETEST_TOLERANCE}")
+            logger.info(f"    Timeout after {self.RETEST_TIMEOUT}min with {len(retest_slice)} bars analyzed")
+        
+        return retest_analysis
+    
     def process_clusters_with_modal_analysis(self, bars_15min: List[Dict[str, Any]], 
                                            bars_1min: List[Dict[str, Any]],
                                            daily_thresholds: Dict[str, Dict[str, float]]) -> tuple:
@@ -1068,6 +1233,339 @@ class VolumeClusterTester:
         logger.info(f"✅ Processed {len(all_clusters)} clusters with momentum analysis, {len(tradeable_clusters)} tradeable")
         return all_clusters, tradeable_clusters
     
+    def process_clusters_with_signal_strength_analysis(self, bars_15min: List[Dict[str, Any]], 
+                                                      bars_1min: List[Dict[str, Any]],
+                                                      daily_thresholds: Dict[str, Dict[str, float]]) -> tuple:
+        """
+        Process clusters chronologically with modal position, momentum, AND signal strength analysis
+        Returns: (all_clusters_with_signal_strength, tradeable_clusters_with_signal_strength)
+        """
+        logger.info("🔍 Processing clusters with modal position, momentum, and signal strength analysis...")
+        
+        all_clusters = []
+        tradeable_clusters = []
+        processed_clusters = []  # Track past clusters for ranking
+        
+        # Sort bars chronologically
+        sorted_bars = sorted(bars_15min, key=lambda x: x['timestamp'])
+        
+        for bar in sorted_bars:
+            date_str = bar['timestamp'].strftime('%Y-%m-%d')
+            
+            if date_str not in daily_thresholds:
+                continue
+            
+            thresholds = daily_thresholds[date_str]
+            daily_avg_1min_volume = thresholds['daily_avg_1min_volume']
+            
+            # Calculate volume ratio
+            cluster_volume = bar['volume']
+            volume_ratio = cluster_volume / daily_avg_1min_volume
+            
+            # Check if this qualifies as a volume cluster (4x threshold)
+            if volume_ratio >= self.VOLUME_MULTIPLIER:
+                
+                # Get rolling volume rank (only using past clusters - bias-free)
+                volume_rank = self.get_rolling_volume_rank(
+                    bar['timestamp'], volume_ratio, processed_clusters
+                )
+                
+                # Calculate modal position analysis
+                modal_analysis = self.calculate_modal_position(bar['timestamp'], bars_1min)
+                
+                # Calculate pre-cluster momentum analysis
+                momentum_analysis = self.calculate_pre_cluster_momentum(bar['timestamp'], bars_1min)
+                
+                # Determine signal direction based on modal position
+                direction_analysis = self.determine_signal_direction(modal_analysis['modal_position'])
+                
+                # Calculate signal strength
+                strength_analysis = self.calculate_signal_strength(
+                    modal_analysis['modal_position'],
+                    volume_ratio,
+                    momentum_analysis['momentum'],
+                    direction_analysis['direction']
+                )
+                
+                # Create cluster with ranking, modal, momentum, and signal strength info
+                cluster_bar = bar.copy()
+                cluster_bar['volume_ratio'] = volume_ratio
+                cluster_bar['daily_avg_1min_volume'] = daily_avg_1min_volume
+                cluster_bar['volume_rank'] = volume_rank
+                cluster_bar['date'] = date_str
+                cluster_bar['is_tradeable'] = volume_rank <= self.TOP_N_CLUSTERS_PER_DAY
+                
+                # Add modal analysis results
+                cluster_bar.update({
+                    'modal_price': modal_analysis['modal_price'],
+                    'modal_position': modal_analysis['modal_position'],
+                    'price_high': modal_analysis['price_high'],
+                    'price_low': modal_analysis['price_low'],
+                    'price_range': modal_analysis['price_range'],
+                    'modal_data_points': modal_analysis['data_points'],
+                    'modal_error': modal_analysis['error']
+                })
+                
+                # Add momentum analysis results
+                cluster_bar.update({
+                    'momentum': momentum_analysis['momentum'],
+                    'momentum_start_price': momentum_analysis['start_price'],
+                    'momentum_end_price': momentum_analysis['end_price'],
+                    'momentum_price_change': momentum_analysis['price_change'],
+                    'momentum_data_points': momentum_analysis['data_points'],
+                    'momentum_error': momentum_analysis['error']
+                })
+                
+                # Add direction analysis results
+                cluster_bar.update({
+                    'signal_direction': direction_analysis['direction'],
+                    'position_strength': direction_analysis['position_strength'],
+                    'signal_type': direction_analysis['signal_type'],
+                    'signal_reason': direction_analysis['reason']
+                })
+                
+                # Add signal strength analysis results
+                cluster_bar.update({
+                    'signal_strength': strength_analysis['signal_strength'],
+                    'signal_position_strength': strength_analysis['position_strength'],
+                    'signal_volume_strength': strength_analysis['volume_strength'],
+                    'signal_momentum_strength': strength_analysis['momentum_strength'],
+                    'meets_strength_threshold': strength_analysis['meets_threshold'],
+                    'strength_error': strength_analysis['error']
+                })
+                
+                all_clusters.append(cluster_bar)
+                
+                # Check if this cluster is tradeable (top-N)
+                if volume_rank <= self.TOP_N_CLUSTERS_PER_DAY:
+                    tradeable_clusters.append(cluster_bar)
+                    
+                    signal_info = f"Signal: {direction_analysis['signal_type']}"
+                    if direction_analysis['direction']:
+                        signal_info += f" ({direction_analysis['direction'].upper()}, strength: {direction_analysis['position_strength']:.3f})"
+                    
+                    modal_str = f"{modal_analysis['modal_position']:.3f}" if modal_analysis['modal_position'] is not None else "N/A"
+                    momentum_str = f"{momentum_analysis['momentum']:.4f}" if momentum_analysis['momentum'] is not None else "N/A"
+                    momentum_pct = f"({momentum_analysis['momentum']*100:+.2f}%)" if momentum_analysis['momentum'] is not None else ""
+                    
+                    # Signal strength info
+                    strength_str = f"{strength_analysis['signal_strength']:.3f}"
+                    threshold_status = "✅ PASS" if strength_analysis['meets_threshold'] else "❌ FAIL"
+                    
+                    logger.info(f"🎯 TRADEABLE Cluster: {bar['timestamp']} - "
+                               f"Volume: {cluster_volume:.0f}, Ratio: {volume_ratio:.2f}x, "
+                               f"Rank: #{volume_rank}, Modal: {modal_str}, "
+                               f"Momentum: {momentum_str} {momentum_pct}, "
+                               f"Strength: {strength_str} ({threshold_status}), "
+                               f"{signal_info}")
+                    
+                    if direction_analysis['signal_type'] != 'NO_DATA':
+                        logger.info(f"    📋 {direction_analysis['reason']}")
+                        if strength_analysis['meets_threshold']:
+                            logger.info(f"    💪 Signal Strength Components: Pos={strength_analysis['position_strength']:.3f}, "
+                                       f"Vol={strength_analysis['volume_strength']:.3f}, Mom={strength_analysis['momentum_strength']:.3f}")
+                else:
+                    signal_info = f"Signal: {direction_analysis['signal_type']}"
+                    if direction_analysis['direction']:
+                        signal_info += f" ({direction_analysis['direction'].upper()})"
+                    
+                    modal_str = f"{modal_analysis['modal_position']:.3f}" if modal_analysis['modal_position'] is not None else "N/A"
+                    momentum_str = f"{momentum_analysis['momentum']:.4f}" if momentum_analysis['momentum'] is not None else "N/A"
+                    strength_str = f"{strength_analysis['signal_strength']:.3f}"
+                    
+                    logger.info(f"📊 Cluster (not tradeable): {bar['timestamp']} - "
+                               f"Volume: {cluster_volume:.0f}, Ratio: {volume_ratio:.2f}x, "
+                               f"Rank: #{volume_rank}, Modal: {modal_str}, "
+                               f"Momentum: {momentum_str}, Strength: {strength_str}, {signal_info}")
+                
+                # Add to processed clusters for future ranking decisions
+                processed_clusters.append({
+                    'timestamp': bar['timestamp'],
+                    'volume_ratio': volume_ratio
+                })
+        
+        logger.info(f"✅ Processed {len(all_clusters)} clusters with signal strength analysis, {len(tradeable_clusters)} tradeable")
+        return all_clusters, tradeable_clusters
+    
+    def process_clusters_with_retest_analysis(self, bars_15min: List[Dict[str, Any]], 
+                                            bars_1min: List[Dict[str, Any]],
+                                            daily_thresholds: Dict[str, Dict[str, float]]) -> tuple:
+        """
+        Process clusters chronologically with modal position, momentum, signal strength, AND retest analysis
+        Returns: (all_clusters_with_retest, tradeable_clusters_with_retest)
+        """
+        logger.info("🔍 Processing clusters with modal position, momentum, signal strength, and retest analysis...")
+        
+        all_clusters = []
+        tradeable_clusters = []
+        processed_clusters = []  # Track past clusters for ranking
+        
+        # Sort bars chronologically
+        sorted_bars = sorted(bars_15min, key=lambda x: x['timestamp'])
+        
+        for bar in sorted_bars:
+            date_str = bar['timestamp'].strftime('%Y-%m-%d')
+            
+            if date_str not in daily_thresholds:
+                continue
+            
+            thresholds = daily_thresholds[date_str]
+            daily_avg_1min_volume = thresholds['daily_avg_1min_volume']
+            
+            # Calculate volume ratio
+            cluster_volume = bar['volume']
+            volume_ratio = cluster_volume / daily_avg_1min_volume
+            
+            # Check if this qualifies as a volume cluster (4x threshold)
+            if volume_ratio >= self.VOLUME_MULTIPLIER:
+                
+                # Get rolling volume rank (only using past clusters - bias-free)
+                volume_rank = self.get_rolling_volume_rank(
+                    bar['timestamp'], volume_ratio, processed_clusters
+                )
+                
+                # Calculate modal position analysis
+                modal_analysis = self.calculate_modal_position(bar['timestamp'], bars_1min)
+                
+                # Calculate pre-cluster momentum analysis
+                momentum_analysis = self.calculate_pre_cluster_momentum(bar['timestamp'], bars_1min)
+                
+                # Determine signal direction based on modal position
+                direction_analysis = self.determine_signal_direction(modal_analysis['modal_position'])
+                
+                # Calculate signal strength
+                strength_analysis = self.calculate_signal_strength(
+                    modal_analysis['modal_position'],
+                    volume_ratio,
+                    momentum_analysis['momentum'],
+                    direction_analysis['direction']
+                )
+                
+                # Calculate retest confirmation
+                retest_analysis = self.calculate_retest_confirmation(
+                    bar['timestamp'], 
+                    modal_analysis['modal_price'], 
+                    bars_1min
+                )
+                
+                # Create cluster with all analysis components
+                cluster_bar = bar.copy()
+                cluster_bar['volume_ratio'] = volume_ratio
+                cluster_bar['daily_avg_1min_volume'] = daily_avg_1min_volume
+                cluster_bar['volume_rank'] = volume_rank
+                cluster_bar['date'] = date_str
+                cluster_bar['is_tradeable'] = volume_rank <= self.TOP_N_CLUSTERS_PER_DAY
+                
+                # Add modal analysis results
+                cluster_bar.update({
+                    'modal_price': modal_analysis['modal_price'],
+                    'modal_position': modal_analysis['modal_position'],
+                    'price_high': modal_analysis['price_high'],
+                    'price_low': modal_analysis['price_low'],
+                    'price_range': modal_analysis['price_range'],
+                    'modal_data_points': modal_analysis['data_points'],
+                    'modal_error': modal_analysis['error']
+                })
+                
+                # Add momentum analysis results
+                cluster_bar.update({
+                    'momentum': momentum_analysis['momentum'],
+                    'momentum_start_price': momentum_analysis['start_price'],
+                    'momentum_end_price': momentum_analysis['end_price'],
+                    'momentum_price_change': momentum_analysis['price_change'],
+                    'momentum_data_points': momentum_analysis['data_points'],
+                    'momentum_error': momentum_analysis['error']
+                })
+                
+                # Add direction analysis results
+                cluster_bar.update({
+                    'signal_direction': direction_analysis['direction'],
+                    'position_strength': direction_analysis['position_strength'],
+                    'signal_type': direction_analysis['signal_type'],
+                    'signal_reason': direction_analysis['reason']
+                })
+                
+                # Add signal strength analysis results
+                cluster_bar.update({
+                    'signal_strength': strength_analysis['signal_strength'],
+                    'signal_position_strength': strength_analysis['position_strength'],
+                    'signal_volume_strength': strength_analysis['volume_strength'],
+                    'signal_momentum_strength': strength_analysis['momentum_strength'],
+                    'meets_strength_threshold': strength_analysis['meets_threshold'],
+                    'strength_error': strength_analysis['error']
+                })
+                
+                # Add retest analysis results
+                cluster_bar.update({
+                    'retest_confirmed': retest_analysis['retest_confirmed'],
+                    'retest_time': retest_analysis['retest_time'],
+                    'retest_price': retest_analysis['retest_price'],
+                    'time_to_retest': retest_analysis['time_to_retest'],
+                    'min_distance': retest_analysis['min_distance'],
+                    'timeout_occurred': retest_analysis['timeout_occurred'],
+                    'retest_data_points': retest_analysis['data_points'],
+                    'retest_error': retest_analysis['error']
+                })
+                
+                all_clusters.append(cluster_bar)
+                
+                # Check if this cluster is tradeable (top-N)
+                if volume_rank <= self.TOP_N_CLUSTERS_PER_DAY:
+                    tradeable_clusters.append(cluster_bar)
+                    
+                    signal_info = f"Signal: {direction_analysis['signal_type']}"
+                    if direction_analysis['direction']:
+                        signal_info += f" ({direction_analysis['direction'].upper()}, strength: {direction_analysis['position_strength']:.3f})"
+                    
+                    modal_str = f"{modal_analysis['modal_position']:.3f}" if modal_analysis['modal_position'] is not None else "N/A"
+                    momentum_str = f"{momentum_analysis['momentum']:.4f}" if momentum_analysis['momentum'] is not None else "N/A"
+                    momentum_pct = f"({momentum_analysis['momentum']*100:+.2f}%)" if momentum_analysis['momentum'] is not None else ""
+                    
+                    # Signal strength and retest info
+                    strength_str = f"{strength_analysis['signal_strength']:.3f}"
+                    threshold_status = "✅ PASS" if strength_analysis['meets_threshold'] else "❌ FAIL"
+                    retest_status = "✅ RETEST" if retest_analysis['retest_confirmed'] else "❌ NO_RETEST"
+                    
+                    logger.info(f"🎯 TRADEABLE Cluster: {bar['timestamp']} - "
+                               f"Volume: {cluster_volume:.0f}, Ratio: {volume_ratio:.2f}x, "
+                               f"Rank: #{volume_rank}, Modal: {modal_str}, "
+                               f"Momentum: {momentum_str} {momentum_pct}, "
+                               f"Strength: {strength_str} ({threshold_status}), "
+                               f"Retest: {retest_status}, {signal_info}")
+                    
+                    if direction_analysis['signal_type'] != 'NO_DATA':
+                        logger.info(f"    📋 {direction_analysis['reason']}")
+                        if strength_analysis['meets_threshold']:
+                            logger.info(f"    💪 Signal Strength Components: Pos={strength_analysis['position_strength']:.3f}, "
+                                       f"Vol={strength_analysis['volume_strength']:.3f}, Mom={strength_analysis['momentum_strength']:.3f}")
+                        if retest_analysis['retest_confirmed']:
+                            logger.info(f"    🔄 Retest Details: Time={retest_analysis['time_to_retest']:.1f}min, "
+                                       f"Price={retest_analysis['retest_price']:.2f}, Distance={abs(retest_analysis['retest_price'] - modal_analysis['modal_price']):.2f}")
+                else:
+                    signal_info = f"Signal: {direction_analysis['signal_type']}"
+                    if direction_analysis['direction']:
+                        signal_info += f" ({direction_analysis['direction'].upper()})"
+                    
+                    modal_str = f"{modal_analysis['modal_position']:.3f}" if modal_analysis['modal_position'] is not None else "N/A"
+                    momentum_str = f"{momentum_analysis['momentum']:.4f}" if momentum_analysis['momentum'] is not None else "N/A"
+                    strength_str = f"{strength_analysis['signal_strength']:.3f}"
+                    retest_status = "✅ RETEST" if retest_analysis['retest_confirmed'] else "❌ NO_RETEST"
+                    
+                    logger.info(f"📊 Cluster (not tradeable): {bar['timestamp']} - "
+                               f"Volume: {cluster_volume:.0f}, Ratio: {volume_ratio:.2f}x, "
+                               f"Rank: #{volume_rank}, Modal: {modal_str}, "
+                               f"Momentum: {momentum_str}, Strength: {strength_str}, "
+                               f"Retest: {retest_status}, {signal_info}")
+                
+                # Add to processed clusters for future ranking decisions
+                processed_clusters.append({
+                    'timestamp': bar['timestamp'],
+                    'volume_ratio': volume_ratio
+                })
+        
+        logger.info(f"✅ Processed {len(all_clusters)} clusters with retest analysis, {len(tradeable_clusters)} tradeable")
+        return all_clusters, tradeable_clusters
+    
     def print_modal_analysis_summary(self, all_clusters: List[Dict[str, Any]], 
                                    tradeable_clusters: List[Dict[str, Any]]):
         """Print detailed summary with modal position analysis"""
@@ -1246,7 +1744,7 @@ class VolumeClusterTester:
         logger.info(f"\n⚙️  DIRECTION DETERMINATION PARAMETERS:")
         logger.info(f"  Long Threshold: ≤ {self.TIGHT_LONG_THRESHOLD}")
         logger.info(f"  Short Threshold: ≥ 0.85 (DISABLED: {self.ELIMINATE_SHORTS})")
-        logger.info(f"  No-Trade Zone: 0.15 < modal_position < 0.85")
+        logger.info(f"  No-Trade Zone: {self.TIGHT_LONG_THRESHOLD} < modal_position < 0.85")
         
         logger.info("=" * 80)
     
@@ -1354,6 +1852,272 @@ class VolumeClusterTester:
         
         logger.info("=" * 80)
     
+    def print_signal_strength_analysis_summary(self, all_clusters: List[Dict[str, Any]], 
+                                             tradeable_clusters: List[Dict[str, Any]]):
+        """Print detailed summary with signal strength analysis"""
+        logger.info("=" * 90)
+        logger.info("📊 VOLUME CLUSTER DETECTION WITH SIGNAL STRENGTH ANALYSIS RESULTS")
+        logger.info("=" * 90)
+        
+        total_clusters = len(all_clusters)
+        total_tradeable = len(tradeable_clusters)
+        
+        logger.info(f"🎯 Total Volume Clusters Detected: {total_clusters}")
+        logger.info(f"💰 Tradeable Clusters (Top-{self.TOP_N_CLUSTERS_PER_DAY}): {total_tradeable}")
+        logger.info(f"📈 Trade Rate: {total_tradeable/total_clusters*100:.1f}% of clusters are tradeable")
+        
+        if total_clusters == 0:
+            logger.info("❌ No volume clusters found in the 10-day period")
+            return
+        
+        # Signal Strength Analysis - All Clusters
+        valid_strength_clusters = [c for c in all_clusters if c.get('signal_strength') is not None]
+        if len(valid_strength_clusters) > 0:
+            logger.info(f"\n💪 SIGNAL STRENGTH ANALYSIS (All {len(valid_strength_clusters)} clusters with strength data):")
+            
+            strengths = [c['signal_strength'] for c in valid_strength_clusters]
+            passing_threshold = [c for c in valid_strength_clusters if c['meets_strength_threshold']]
+            
+            logger.info(f"  Average Signal Strength: {sum(strengths)/len(strengths):.3f}")
+            logger.info(f"  Signal Strength Range: {min(strengths):.3f} - {max(strengths):.3f}")
+            logger.info(f"  Clusters Meeting Threshold (≥{self.MIN_SIGNAL_STRENGTH}): {len(passing_threshold)} ({len(passing_threshold)/len(strengths)*100:.1f}%)")
+            
+            # Component analysis
+            position_strengths = [c['signal_position_strength'] for c in valid_strength_clusters]
+            volume_strengths = [c['signal_volume_strength'] for c in valid_strength_clusters]
+            momentum_strengths = [c['signal_momentum_strength'] for c in valid_strength_clusters]
+            
+            logger.info(f"\n  📊 STRENGTH COMPONENTS BREAKDOWN:")
+            logger.info(f"    Position Strength (50%): Avg={sum(position_strengths)/len(position_strengths):.3f}, Range={min(position_strengths):.3f}-{max(position_strengths):.3f}")
+            logger.info(f"    Volume Strength (30%): Avg={sum(volume_strengths)/len(volume_strengths):.3f}, Range={min(volume_strengths):.3f}-{max(volume_strengths):.3f}")
+            logger.info(f"    Momentum Strength (20%): Avg={sum(momentum_strengths)/len(momentum_strengths):.3f}, Range={min(momentum_strengths):.3f}-{max(momentum_strengths):.3f}")
+        
+        # Signal Strength Analysis - Tradeable Clusters
+        valid_tradeable_strength = [c for c in tradeable_clusters if c.get('signal_strength') is not None]
+        if len(valid_tradeable_strength) > 0:
+            logger.info(f"\n💰 TRADEABLE SIGNAL STRENGTH ANALYSIS ({len(valid_tradeable_strength)} clusters):")
+            
+            tradeable_strengths = [c['signal_strength'] for c in valid_tradeable_strength]
+            tradeable_passing = [c for c in valid_tradeable_strength if c['meets_strength_threshold']]
+            
+            logger.info(f"  Average Signal Strength: {sum(tradeable_strengths)/len(tradeable_strengths):.3f}")
+            logger.info(f"  Signal Strength Range: {min(tradeable_strengths):.3f} - {max(tradeable_strengths):.3f}")
+            logger.info(f"  Tradeable Meeting Threshold: {len(tradeable_passing)} ({len(tradeable_passing)/len(tradeable_strengths)*100:.1f}%)")
+            
+            # Tradeable component analysis
+            tradeable_pos_strengths = [c['signal_position_strength'] for c in valid_tradeable_strength]
+            tradeable_vol_strengths = [c['signal_volume_strength'] for c in valid_tradeable_strength]
+            tradeable_mom_strengths = [c['signal_momentum_strength'] for c in valid_tradeable_strength]
+            
+            logger.info(f"  📊 TRADEABLE STRENGTH COMPONENTS:")
+            logger.info(f"    Position Strength: Avg={sum(tradeable_pos_strengths)/len(tradeable_pos_strengths):.3f}")
+            logger.info(f"    Volume Strength: Avg={sum(tradeable_vol_strengths)/len(tradeable_vol_strengths):.3f}")
+            logger.info(f"    Momentum Strength: Avg={sum(tradeable_mom_strengths)/len(tradeable_mom_strengths):.3f}")
+        
+        # High-Quality Signal Analysis (LONG + Meets Strength Threshold)
+        high_quality_signals = [c for c in all_clusters if 
+                               c.get('signal_type') == 'LONG' and 
+                               c.get('meets_strength_threshold') == True]
+        
+        if high_quality_signals:
+            logger.info(f"\n🎯 HIGH-QUALITY SIGNALS ANALYSIS (LONG + Strength ≥{self.MIN_SIGNAL_STRENGTH}):")
+            logger.info(f"  Total High-Quality Signals: {len(high_quality_signals)} out of {len(all_clusters)} clusters ({len(high_quality_signals)/len(all_clusters)*100:.1f}%)")
+            
+            # Tradeable high-quality signals
+            tradeable_high_quality = [c for c in high_quality_signals if c['is_tradeable']]
+            logger.info(f"  Tradeable High-Quality Signals: {len(tradeable_high_quality)} ({len(tradeable_high_quality)/len(high_quality_signals)*100:.1f}% of high-quality)")
+            
+            if tradeable_high_quality:
+                hq_strengths = [c['signal_strength'] for c in tradeable_high_quality]
+                hq_modal_positions = [c['modal_position'] for c in tradeable_high_quality]
+                hq_momentums = [c['momentum'] for c in tradeable_high_quality if c['momentum'] is not None]
+                
+                logger.info(f"  📊 TRADEABLE HIGH-QUALITY SIGNAL CHARACTERISTICS:")
+                logger.info(f"    Average Signal Strength: {sum(hq_strengths)/len(hq_strengths):.3f}")
+                logger.info(f"    Average Modal Position: {sum(hq_modal_positions)/len(hq_modal_positions):.3f}")
+                if hq_momentums:
+                    logger.info(f"    Average Momentum: {sum(hq_momentums)/len(hq_momentums):.4f} ({sum(hq_momentums)/len(hq_momentums)*100:+.2f}%)")
+                
+                # Daily distribution
+                hq_dates = {}
+                for cluster in tradeable_high_quality:
+                    date = cluster['date']
+                    hq_dates[date] = hq_dates.get(date, 0) + 1
+                
+                logger.info(f"    Daily Distribution: {len(hq_dates)} days with high-quality signals")
+                logger.info(f"    Average High-Quality Signals per Day: {len(tradeable_high_quality)/10:.1f}")
+        
+        # Daily breakdown with signal strength
+        clusters_by_date = {}
+        for cluster in all_clusters:
+            date = cluster['date']
+            if date not in clusters_by_date:
+                clusters_by_date[date] = []
+            clusters_by_date[date].append(cluster)
+        
+        logger.info("\n📅 Daily Breakdown with Signal Strength Analysis:")
+        for date in sorted(clusters_by_date.keys()):
+            daily_clusters = clusters_by_date[date]
+            daily_tradeable = [c for c in daily_clusters if c['is_tradeable']]
+            
+            # Count high-quality signals for this day
+            daily_hq = len([c for c in daily_clusters if c.get('signal_type') == 'LONG' and c.get('meets_strength_threshold') == True])
+            tradeable_hq = len([c for c in daily_tradeable if c.get('signal_type') == 'LONG' and c.get('meets_strength_threshold') == True])
+            
+            # Calculate daily strength stats
+            daily_valid_strength = [c for c in daily_clusters if c.get('signal_strength') is not None]
+            if daily_valid_strength:
+                daily_strengths = [c['signal_strength'] for c in daily_valid_strength]
+                avg_strength = sum(daily_strengths) / len(daily_strengths)
+                passing_count = len([c for c in daily_valid_strength if c['meets_strength_threshold']])
+                
+                logger.info(f"  {date}: {len(daily_clusters)} clusters ({len(daily_tradeable)} tradeable)")
+                logger.info(f"    Avg Strength: {avg_strength:.3f}, Passing Threshold: {passing_count}/{len(daily_valid_strength)} ({passing_count/len(daily_valid_strength)*100:.0f}%)")
+                logger.info(f"    High-Quality Signals: {daily_hq} total, {tradeable_hq} tradeable")
+        
+        # Parameter summary
+        logger.info(f"\n⚙️  SIGNAL STRENGTH PARAMETERS:")
+        logger.info(f"  Position Strength Weight: 70% (1.0 - modal_position / {self.TIGHT_LONG_THRESHOLD})")
+        logger.info(f"  Volume Strength Weight: 30% (min(volume_ratio / 150.0, 1.0))")
+        logger.info(f"  Momentum Strength Weight: 0% (removed - was blocking trades)")
+        logger.info(f"  Signal Strength Threshold: ≥ {self.MIN_SIGNAL_STRENGTH}")
+        logger.info(f"  Combined Formula: 0.7×Position + 0.3×Volume")
+        
+        logger.info("=" * 90)
+    
+    def print_retest_analysis_summary(self, all_clusters: List[Dict[str, Any]], 
+                                    tradeable_clusters: List[Dict[str, Any]]):
+        """Print detailed summary with retest analysis"""
+        logger.info("=" * 100)
+        logger.info("📊 VOLUME CLUSTER DETECTION WITH RETEST ANALYSIS RESULTS")
+        logger.info("=" * 100)
+        
+        total_clusters = len(all_clusters)
+        total_tradeable = len(tradeable_clusters)
+        
+        logger.info(f"🎯 Total Volume Clusters Detected: {total_clusters}")
+        logger.info(f"💰 Tradeable Clusters (Top-{self.TOP_N_CLUSTERS_PER_DAY}): {total_tradeable}")
+        logger.info(f"📈 Trade Rate: {total_tradeable/total_clusters*100:.1f}% of clusters are tradeable")
+        
+        if total_clusters == 0:
+            logger.info("❌ No volume clusters found in the 10-day period")
+            return
+        
+        # Retest Analysis - All Clusters
+        valid_retest_clusters = [c for c in all_clusters if c.get('retest_confirmed') is not None]
+        if len(valid_retest_clusters) > 0:
+            logger.info(f"\n🔄 RETEST ANALYSIS (All {len(valid_retest_clusters)} clusters with retest data):")
+            
+            retest_confirmed = [c for c in valid_retest_clusters if c['retest_confirmed']]
+            retest_failed = [c for c in valid_retest_clusters if not c['retest_confirmed']]
+            
+            logger.info(f"  Retest Confirmed: {len(retest_confirmed)} clusters ({len(retest_confirmed)/len(valid_retest_clusters)*100:.1f}%)")
+            logger.info(f"  Retest Failed: {len(retest_failed)} clusters ({len(retest_failed)/len(valid_retest_clusters)*100:.1f}%)")
+            
+            if retest_confirmed:
+                retest_times = [c['time_to_retest'] for c in retest_confirmed if c['time_to_retest'] is not None]
+                retest_distances = [abs(c['retest_price'] - c['modal_price']) for c in retest_confirmed 
+                                  if c['retest_price'] is not None and c['modal_price'] is not None]
+                
+                if retest_times:
+                    logger.info(f"  Average Time to Retest: {sum(retest_times)/len(retest_times):.1f} minutes")
+                    logger.info(f"  Retest Time Range: {min(retest_times):.1f} - {max(retest_times):.1f} minutes")
+                
+                if retest_distances:
+                    logger.info(f"  Average Retest Distance: {sum(retest_distances)/len(retest_distances):.2f} points")
+                    logger.info(f"  Retest Distance Range: {min(retest_distances):.2f} - {max(retest_distances):.2f} points")
+            
+            if retest_failed:
+                failed_distances = [c['min_distance'] for c in retest_failed if c['min_distance'] is not None]
+                if failed_distances:
+                    logger.info(f"  Failed Retest Min Distance: {sum(failed_distances)/len(failed_distances):.2f} points (avg)")
+        
+        # Retest Analysis - Tradeable Clusters
+        valid_tradeable_retest = [c for c in tradeable_clusters if c.get('retest_confirmed') is not None]
+        if len(valid_tradeable_retest) > 0:
+            logger.info(f"\n💰 TRADEABLE RETEST ANALYSIS ({len(valid_tradeable_retest)} clusters):")
+            
+            tradeable_retest_confirmed = [c for c in valid_tradeable_retest if c['retest_confirmed']]
+            tradeable_retest_failed = [c for c in valid_tradeable_retest if not c['retest_confirmed']]
+            
+            logger.info(f"  Tradeable Retest Confirmed: {len(tradeable_retest_confirmed)} ({len(tradeable_retest_confirmed)/len(valid_tradeable_retest)*100:.1f}%)")
+            logger.info(f"  Tradeable Retest Failed: {len(tradeable_retest_failed)} ({len(tradeable_retest_failed)/len(valid_tradeable_retest)*100:.1f}%)")
+            
+            if tradeable_retest_confirmed:
+                tradeable_times = [c['time_to_retest'] for c in tradeable_retest_confirmed if c['time_to_retest'] is not None]
+                if tradeable_times:
+                    logger.info(f"  Avg Tradeable Retest Time: {sum(tradeable_times)/len(tradeable_times):.1f} minutes")
+        
+        # High-Quality Signal Analysis (LONG + Meets Strength Threshold + Retest Confirmed)
+        high_quality_signals = [c for c in all_clusters if 
+                               c.get('signal_type') == 'LONG' and 
+                               c.get('meets_strength_threshold') == True and
+                               c.get('retest_confirmed') == True]
+        
+        if high_quality_signals:
+            logger.info(f"\n🎯 ULTRA-HIGH-QUALITY SIGNALS (LONG + Strength ≥{self.MIN_SIGNAL_STRENGTH} + Retest):")
+            logger.info(f"  Total Ultra-High-Quality Signals: {len(high_quality_signals)} out of {len(all_clusters)} clusters ({len(high_quality_signals)/len(all_clusters)*100:.1f}%)")
+            
+            # Tradeable ultra-high-quality signals
+            tradeable_ultra_hq = [c for c in high_quality_signals if c['is_tradeable']]
+            logger.info(f"  Tradeable Ultra-High-Quality Signals: {len(tradeable_ultra_hq)} ({len(tradeable_ultra_hq)/len(high_quality_signals)*100:.1f}% of ultra-high-quality)")
+            
+            if tradeable_ultra_hq:
+                uhq_strengths = [c['signal_strength'] for c in tradeable_ultra_hq]
+                uhq_modal_positions = [c['modal_position'] for c in tradeable_ultra_hq]
+                uhq_retest_times = [c['time_to_retest'] for c in tradeable_ultra_hq if c['time_to_retest'] is not None]
+                
+                logger.info(f"  📊 TRADEABLE ULTRA-HIGH-QUALITY SIGNAL CHARACTERISTICS:")
+                logger.info(f"    Average Signal Strength: {sum(uhq_strengths)/len(uhq_strengths):.3f}")
+                logger.info(f"    Average Modal Position: {sum(uhq_modal_positions)/len(uhq_modal_positions):.3f}")
+                if uhq_retest_times:
+                    logger.info(f"    Average Retest Time: {sum(uhq_retest_times)/len(uhq_retest_times):.1f} minutes")
+                
+                # Daily distribution
+                uhq_dates = {}
+                for cluster in tradeable_ultra_hq:
+                    date = cluster['date']
+                    uhq_dates[date] = uhq_dates.get(date, 0) + 1
+                
+                logger.info(f"    Daily Distribution: {len(uhq_dates)} days with ultra-high-quality signals")
+                logger.info(f"    Average Ultra-High-Quality Signals per Day: {len(tradeable_ultra_hq)/10:.1f}")
+        
+        # Daily breakdown with retest analysis
+        clusters_by_date = {}
+        for cluster in all_clusters:
+            date = cluster['date']
+            if date not in clusters_by_date:
+                clusters_by_date[date] = []
+            clusters_by_date[date].append(cluster)
+        
+        logger.info("\n📅 Daily Breakdown with Retest Analysis:")
+        for date in sorted(clusters_by_date.keys()):
+            daily_clusters = clusters_by_date[date]
+            daily_tradeable = [c for c in daily_clusters if c['is_tradeable']]
+            
+            # Count retest confirmations for this day
+            daily_retests = len([c for c in daily_clusters if c.get('retest_confirmed') == True])
+            tradeable_retests = len([c for c in daily_tradeable if c.get('retest_confirmed') == True])
+            
+            # Count ultra-high-quality signals for this day
+            daily_uhq = len([c for c in daily_clusters if c.get('signal_type') == 'LONG' and 
+                           c.get('meets_strength_threshold') == True and c.get('retest_confirmed') == True])
+            tradeable_uhq = len([c for c in daily_tradeable if c.get('signal_type') == 'LONG' and 
+                               c.get('meets_strength_threshold') == True and c.get('retest_confirmed') == True])
+            
+            logger.info(f"  {date}: {len(daily_clusters)} clusters ({len(daily_tradeable)} tradeable)")
+            logger.info(f"    Retests: {daily_retests} total, {tradeable_retests} tradeable")
+            logger.info(f"    Ultra-HQ Signals: {daily_uhq} total, {tradeable_uhq} tradeable")
+        
+        # Parameter summary
+        logger.info(f"\n⚙️  RETEST ANALYSIS PARAMETERS:")
+        logger.info(f"  Retest Tolerance: ±{self.RETEST_TOLERANCE} points")
+        logger.info(f"  Retest Timeout: {self.RETEST_TIMEOUT} minutes")
+        logger.info(f"  Retest Window: Post-cluster formation")
+        logger.info(f"  Ultra-HQ Criteria: LONG + Strength ≥{self.MIN_SIGNAL_STRENGTH} + Retest Confirmed")
+        
+        logger.info("=" * 100)
+    
     async def run_cluster_test(self):
         """Main execution flow for cluster testing"""
         logger.info("🚀 Starting Volume Cluster Detection Backtest")
@@ -1387,11 +2151,11 @@ class VolumeClusterTester:
             logger.error("❌ Failed to calculate daily thresholds")
             return
         
-        # Step 6: Process clusters chronologically with momentum analysis
-        all_clusters, tradeable_clusters = self.process_clusters_with_momentum_analysis(bars_15min, bars_1min, daily_thresholds)
+        # Step 6: Process clusters chronologically with retest analysis
+        all_clusters, tradeable_clusters = self.process_clusters_with_retest_analysis(bars_15min, bars_1min, daily_thresholds)
         
-        # Step 7: Print results with momentum analysis
-        self.print_momentum_analysis_summary(all_clusters, tradeable_clusters)
+        # Step 7: Print results with retest analysis
+        self.print_retest_analysis_summary(all_clusters, tradeable_clusters)
 
 
 async def main():
