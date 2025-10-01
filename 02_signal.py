@@ -634,17 +634,18 @@ class VolumeClusterProcessor:
         
         # ✅ TRADE EXECUTION: Send confirmed signal to 03_trader.py
         try:
-            # Import 03_trader module for trade execution
-            import importlib.util
+            # Import 03_trader module for trade execution (relative import to use venv)
             import sys
+            import os
             
-            # Dynamic import to avoid circular dependencies
-            trader_spec = importlib.util.spec_from_file_location(
-                "trader_module", 
-                "/Users/albertbeccu/Library/CloudStorage/OneDrive-Personal/NordicOwl/Thoendel/New Algo Trader/New_Algo/03_trader.py"
-            )
-            trader_module = importlib.util.module_from_spec(trader_spec)
-            trader_spec.loader.exec_module(trader_module)
+            # Add current directory to path if not already there
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            if current_dir not in sys.path:
+                sys.path.insert(0, current_dir)
+            
+            # Simple import that respects venv
+            import importlib
+            trader_module = importlib.import_module('03_trader')
             
             # Prepare signal data for trader
             signal_data = {
@@ -858,16 +859,18 @@ def handle_bar(bar_data: Dict[str, Any]) -> None:
         
         # ✅ TRADE MONITORING: Send market data to 03_trader.py for open position monitoring
         try:
-            # Import 03_trader module for market data handling
-            import importlib.util
+            # Import 03_trader module for market data handling (relative import to use venv)
+            import sys
+            import os
             
-            # Dynamic import to avoid circular dependencies
-            trader_spec = importlib.util.spec_from_file_location(
-                "trader_module", 
-                "/Users/albertbeccu/Library/CloudStorage/OneDrive-Personal/NordicOwl/Thoendel/New Algo Trader/New_Algo/03_trader.py"
-            )
-            trader_module = importlib.util.module_from_spec(trader_spec)
-            trader_spec.loader.exec_module(trader_module)
+            # Add current directory to path if not already there
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            if current_dir not in sys.path:
+                sys.path.insert(0, current_dir)
+            
+            # Simple import that respects venv
+            import importlib
+            trader_module = importlib.import_module('03_trader')
             
             # Send market data for trade monitoring
             trader_module.handle_market_data(bar_data)
